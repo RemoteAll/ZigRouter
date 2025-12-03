@@ -1,0 +1,72 @@
+# ============================================
+# ZigNas 工作区通用 .gitignore
+# ============================================
+
+# ========== Zig 构建产物（全局匹配）==========
+# 适用于所有子项目
+**/.zig-cache/
+**/zig-cache/
+**/zig-out/
+
+# ========== 构建目录 ==========
+**/release/
+**/debug/
+**/build/
+**/build-*/
+**/docgen_tmp/
+
+# ========== 编译产物 ==========
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+# 保留 zig-out 中的 exe（已被上面的规则忽略）
+
+# ========== 编辑器/IDE ==========
+# VS Code（保留共享配置）
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains IDE
+.idea/
+*.iml
+
+# Vim/Neovim
+*.swp
+*.swo
+*~
+
+# ========== 操作系统 ==========
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# ========== 日志和临时文件 ==========
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# ========== 敏感信息 ==========
+*.env
+.env.*
+secrets.*
+*.key
+*.pem

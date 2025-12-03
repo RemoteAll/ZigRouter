@@ -89,6 +89,48 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // ====== 打洞服务端可执行文件 ======
+    const server_exe = b.addExecutable(.{
+        .name = "punch_server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tunnel/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(server_exe);
+
+    // 服务端运行步骤
+    const run_server_step = b.step("run-server", "Run the punch server");
+    const run_server_cmd = b.addRunArtifact(server_exe);
+    run_server_step.dependOn(&run_server_cmd.step);
+    run_server_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_server_cmd.addArgs(args);
+    }
+
+    // ====== 打洞客户端可执行文件 ======
+    const client_exe = b.addExecutable(.{
+        .name = "punch_client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tunnel/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(client_exe);
+
+    // 客户端运行步骤
+    const run_client_step = b.step("run-client", "Run the punch client");
+    const run_client_cmd = b.addRunArtifact(client_exe);
+    run_client_step.dependOn(&run_client_cmd.step);
+    run_client_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_client_cmd.addArgs(args);
+    }
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
