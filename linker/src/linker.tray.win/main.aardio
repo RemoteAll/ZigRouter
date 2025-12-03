@@ -1,0 +1,333 @@
+import win.ui;
+/*DSG{{*/
+mainForm = win.form(text="linker tray";right=241;bottom=193;border="thin";max=false;min=false)
+mainForm.add(
+btnInstall={cls="button";text="安装服务";left=79;top=12;right=167;bottom=54;z=1};
+btnRun={cls="button";text="运行服务";left=79;top=63;right=167;bottom=102;z=2};
+btnWebFull={cls="button";text="管理(专业)";left=130;top=116;right=202;bottom=145;z=5};
+btnWebNet={cls="button";text="管理(简单)";left=45;top=116;right=117;bottom=145;z=4};
+ckAutoStart={cls="checkbox";text="托盘自启动";left=140;top=167;right=226;bottom=184;z=3};
+ckTopMost={cls="checkbox";text="窗口置顶";left=12;top=168;right=92;bottom=185;z=6}
+)
+/*}}*/
+
+import win.ui.atom;
+import thread;
+var atom,hwndConflict = mainForm.atom("36E2C876-A68F-456C-98B7-CBE08C5B8B06");
+if(!atom){
+	thread.delay(1000);
+	var atom,hwndConflict = mainForm.atom("36E2C876-A68F-456C-98B7-CBE08C5B8B06");
+	if(!atom){
+		/*为窗口设置原子值可以避免一个程序重复运行多个实例*/
+		win.quitMessage();	return;
+	}
+};
+import fsys;
+try{
+	fsys.delete(io._exefile+".temp");
+}
+catch(e){
+}
+
+
+mainForm.serviceName = "linker.service";
+mainForm.exeName = "linker.exe";
+
+import win.image;
+hIcon = win.image.loadIconFromFile("/res/favicon.ico",true);
+hIcon1 = win.image.loadIconFromFile("/res/favicon1.ico",true);
+mainForm.myTray = null;
+mainForm.wndproc = function(hwnd,message,wParam,lParam){
+		
+		//托盘菜单
+		if(message === 0xACCF ){
+			//右键
+			if( lParam === 0x205){
+				
+    			var pt = ::POINT();
+        		::User32.GetCursorPos(pt);
+        		win.setForeground(mainForm.hwnd)
+        		mainForm.popmenu.popup(pt.x,pt.y,true );
+        		
+			} 
+			//左键
+			if(lParam === 0x0202){
+				mainForm.show();
+				mainForm.topmostExists();
+			} 
+		}
+		//关闭
+		if(message === 0x10){
+			mainForm.show(false);
+			return 0;
+		}
+}
+mainForm.showPopmenu = function(){
+	import win.util.tray;
+	import win.ui.menu;
+	import service;
+	
+	if(mainForm.myTray != null){
+		mainForm.myTray.delete();
+		mainForm.myTray = null;
+	}
+	tray = win.util.tray(mainForm);
+	mainForm.myTray = tray;
+	if(service.isRunning(mainForm.serviceName))
+	{
+		tray.icon = hIcon; 
+	}else
+	{
+		tray.icon = hIcon1; 
+	}
+	tray.tip = mainForm.text;
+	tray.message = 0xACCF;
+	mainForm.popmenu=win.ui.popmenu(mainForm);
+	
+	mainForm.popmenu.add(mainForm.ckAutoStart.checked ? '取消自启动':'开启自启动',function(id){mainForm.runAsTaskCommand()});
+	mainForm.popmenu.add('-------------',function(id){});
+	mainForm.popmenu.add(service.isRunning(mainForm.serviceName) ? '停止服务':'运行服务',function(id){mainForm.runCommand()});
+	mainForm.popmenu.add(service.isExist(mainForm.serviceName) ? '卸载服务':'安装服务',function(id){mainForm.installCommand()});
+	mainForm.popmenu.add('-------------',function(id){});
+	mainForm.popmenu.add('管理(简单)',function(id){mainForm.showNetFrm();});
+	mainForm.popmenu.add('管理(专业)',function(id){mainForm.showFullFrm();});
+	mainForm.popmenu.add('-------------',function(id){});
+	mainForm.popmenu.add('退出托盘',function(id){
+		win.quitMessage();
+   		mainForm.close();
+	});
+}
+
+mainForm.reStart = function(){
+	import process.popen;
+	var prcs = process.popen.cmd("start "+io._exefile+" --task=1");
+	win.quitMessage();
+   	mainForm.close();
+}
+mainForm.failureService = function(){
+	import process.popen;
+	var prcs = process.popen.cmd("sc failure " + mainForm.serviceName +" reset= 0 actions= restart/3000/restart/3000/restart/3000")
+	prcs.readAll();
+}
+
+mainForm.checkService = function(){
+	import service;
+	mainForm.btnInstall.text = service.isExist(mainForm.serviceName) ? "卸载服务" : "安装服务";
+	mainForm.btnRun.text = service.isRunning(mainForm.serviceName) ? "停止服务" : "运行服务";
+	mainForm.showPopmenu();
+	mainForm.runAsTaskCheck();
+	
+	mainForm.failureService();
+}
+
+mainForm.checkServiceInstall = "";
+mainForm.checkServiceRun = "";
+
+mainForm.checkService1 = function(){
+	import service;
+	
+	mainForm.btnInstall.text = service.isExist(mainForm.serviceName) ? "卸载服务" : "安装服务";
+	mainForm.btnRun.text = service.isRunning(mainForm.serviceName) ? "停止服务" : "运行服务";
+	if(mainForm.checkServiceInstall != mainForm.btnInstall.text || mainForm.checkServiceRun != mainForm.btnRun.text)
+	{
+		mainForm.showPopmenu();
+	}
+	
+	mainForm.checkServiceInstall = mainForm.btnInstall.text;
+	mainForm.checkServiceRun = mainForm.btnRun.text ; 
+}
+
+mainForm.runCommand = function(id,event){
+	import thread;
+	thread.invoke( 
+		function(mainForm){
+			import service;
+			import win.ui;
+			import thread;
+			import console;
+			try{
+				mainForm.btnRun.text = '....';
+				if(service.isRunning(mainForm.serviceName)){
+					if(service.stop(mainForm.serviceName,true)){
+						while(service.isRunning(mainForm.serviceName))
+						{
+							thread.delay(100);
+						}
+					}else{
+						win.msgbox("停止失败",null,null,mainForm.hwnd,1000);	
+					}
+					
+				}else{
+					if(service.start(mainForm.serviceName)){
+						while(!service.isRunning(mainForm.serviceName))
+						{
+							thread.delay(100);
+						}
+					}else{
+						win.msgbox("运行失败",null,null,mainForm.hwnd,1000);	
+					}
+				}
+				
+				mainForm.checkService();	
+			}catch(e){
+				console.log(e);
+			}
+		},mainForm
+	);
+}
+mainForm.btnRun.oncommand = function(){
+	mainForm.runCommand();
+}
+
+
+mainForm.installCommand = function(id,event){
+	import thread;
+	thread.invoke( 
+		function(mainForm){
+			import service;
+			import win.ui;
+			try{
+				mainForm.btnInstall.text = '....';
+				if(service.isExist(mainForm.serviceName)){
+					if(service.delete(mainForm.serviceName)){
+						while(service.isExist(mainForm.serviceName))
+						{
+							thread.delay(100);
+						}
+					}else{
+						win.msgbox("卸载失败",null,null,mainForm.hwnd,1000);	
+					}
+				}else{
+					if(service.create(io.fullpath(mainForm.exeName),mainForm.serviceName,mainForm.serviceName,mainForm.serviceName)){
+						while(!service.isExist(mainForm.serviceName) || !service.isRunning(mainForm.serviceName))
+						{
+							thread.delay(100);
+						}
+						service.manager().startDelayed(mainForm.serviceName,true);
+					}else{
+						win.msgbox("安装失败",null,null,mainForm.hwnd,1000);	
+					}
+				}
+				mainForm.checkService();	
+			}catch(e){
+			}
+		},mainForm
+	);
+}
+mainForm.btnInstall.oncommand = function(){
+	mainForm.installCommand();
+}
+
+mainForm.runAsTask = function(run){
+	import sys.runAsTask;
+	task = sys.runAsTask(mainForm.serviceName);
+	if(run)
+	{
+		task.register("--task=1");
+	}else
+	{
+		task.delete();
+	}
+	mainForm.checkService();
+}
+mainForm.runAsTaskCheck = function(){
+	import sys.runAsTask;
+	task = sys.runAsTask(mainForm.serviceName);
+	mainForm.ckAutoStart.checked = task.get() != null;
+}
+mainForm.ckAutoStart.oncommand = function(id,event){
+	mainForm.runAsTask(mainForm.ckAutoStart.checked);
+}
+mainForm.runAsTaskCommand = function(){
+	mainForm.runAsTask(!mainForm.ckAutoStart.checked);
+}
+
+mainForm.showFullFrm = function(){
+	var fullFrm = mainForm.loadForm("/full.aardio");
+	fullFrm.show();
+}
+
+mainForm.btnWebFull.oncommand = function(id,event){
+	mainForm.showFullFrm();
+}
+mainForm.showNetFrm = function(){
+	var netFrm = mainForm.loadForm("/net.aardio");
+	netFrm.show();
+}
+mainForm.btnWebNet.oncommand = function(id,event){
+	mainForm.showNetFrm();
+}
+
+mainForm.startServer = function(){
+	import wsock.tcp.asynHttpServer;
+	mainForm.httpServer = wsock.tcp.asynHttpServer("./web");
+	mainForm.httpServer.defalutDocument = "index.html";
+	mainForm.httpServer.start('0.0.0.0',1803);	
+}
+mainForm.getUrl = function(){
+	if(mainForm.httpServer) return mainForm.httpServer.getUrl();
+	return '';
+}
+
+mainForm.topmostExists = function(){
+	if(io.exist("configs/topmost.txt")) 
+	{
+		mainForm.ckTopMost.checked = true;
+		win.setTopmost(mainForm.hwnd,true);
+	}
+	else
+	{
+		mainForm.ckTopMost.checked = false;
+		win.setTopmost(mainForm.hwnd,false);
+	}
+}
+
+mainForm.ckTopMost.oncommand = function(id,event){
+	import fsys;
+	if(mainForm.ckTopMost.checked)
+	{
+		io.createDir("configs");
+		string.save("configs/topmost.txt", "1");
+	}else
+	{
+		fsys.delete("configs/topmost.txt");
+	}
+	mainForm.topmostExists();
+	
+}
+
+mainForm.checkService();
+mainForm.showPopmenu();
+
+mainForm.setInterval( 
+	function(){
+		import fsys;
+		import process.popen;
+		try{
+			if(io.exist(io._exefile+".temp"))
+			{
+				mainForm.reStart();
+			}
+		}catch(e)
+		{
+		}	
+		try{
+			mainForm.checkService1();	
+		}
+		catch(e){
+			
+		}
+		return true;
+	},1000
+)
+mainForm.show();
+
+mainForm.topmostExists();
+
+if(_ARGV["task"])
+{
+	mainForm.show(false);
+}
+
+
+return win.loopMessage();

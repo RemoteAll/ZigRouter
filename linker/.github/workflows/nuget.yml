@@ -1,0 +1,121 @@
+# This workflow will build a .NET project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
+
+name: Nuget
+
+on:
+  workflow_dispatch:
+
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Build
+      run: |
+        dotnet build ./src/linker.libs -c release
+        dotnet build ./src/linker.messenger -c release
+        dotnet build ./src/linker.messenger.access -c release
+        dotnet build ./src/linker.messenger.action -c release
+        dotnet build ./src/linker.messenger.api -c release
+        dotnet build ./src/linker.messenger.channel -c release
+        dotnet build ./src/linker.messenger.decenter -c release
+        dotnet build ./src/linker.messenger.entry -c release
+        dotnet build ./src/linker.messenger.exroute -c release
+        dotnet build ./src/linker.messenger.flow -c release
+        dotnet build ./src/linker.messenger.forward -c release
+        dotnet build ./src/linker.messenger.listen -c release
+        dotnet build ./src/linker.messenger.logger -c release
+        dotnet build ./src/linker.messenger.pcp -c release
+        dotnet build ./src/linker.messenger.plan -c release
+        dotnet build ./src/linker.messenger.relay -c release
+        dotnet build ./src/linker.messenger.serializer.memorypack -c release
+        dotnet build ./src/linker.messenger.sforward -c release
+        dotnet build ./src/linker.messenger.signin -c release
+        dotnet build ./src/linker.messenger.socks5 -c release
+        dotnet build ./src/linker.messenger.store.file -c release
+        dotnet build ./src/linker.messenger.sync -c release
+        dotnet build ./src/linker.messenger.tunnel -c release
+        dotnet build ./src/linker.messenger.tuntap -c release
+        dotnet build ./src/linker.messenger.updater -c release
+        dotnet build ./src/linker.messenger.firewall -c release
+        dotnet build ./src/linker.messenger.wakeup -c release
+        dotnet build ./src/linker.tun -c release
+        dotnet build ./src/linker.nat -c release
+        dotnet build ./src/linker.tunnel -c release
+
+    - name: Pack
+      run: |
+        dotnet pack ./src/linker.libs -c release
+        dotnet pack ./src/linker.messenger -c release
+        dotnet pack ./src/linker.messenger.access -c release
+        dotnet pack ./src/linker.messenger.action -c release
+        dotnet pack ./src/linker.messenger.api -c release
+        dotnet pack ./src/linker.messenger.channel -c release
+        dotnet pack ./src/linker.messenger.decenter -c release
+        dotnet pack ./src/linker.messenger.entry -c release
+        dotnet pack ./src/linker.messenger.exroute -c release
+        dotnet pack ./src/linker.messenger.flow -c release
+        dotnet pack ./src/linker.messenger.forward -c release
+        dotnet pack ./src/linker.messenger.listen -c release
+        dotnet pack ./src/linker.messenger.logger -c release
+        dotnet pack ./src/linker.messenger.pcp -c release
+        dotnet pack ./src/linker.messenger.plan -c release
+        dotnet pack ./src/linker.messenger.relay -c release
+        dotnet pack ./src/linker.messenger.serializer.memorypack -c release
+        dotnet pack ./src/linker.messenger.sforward -c release
+        dotnet pack ./src/linker.messenger.signin -c release
+        dotnet pack ./src/linker.messenger.socks5 -c release
+        dotnet pack ./src/linker.messenger.store.file -c release
+        dotnet pack ./src/linker.messenger.sync -c release
+        dotnet pack ./src/linker.messenger.tunnel -c release
+        dotnet pack ./src/linker.messenger.tuntap -c release
+        dotnet pack ./src/linker.messenger.updater -c release
+        dotnet pack ./src/linker.messenger.firewall -c release
+        dotnet pack ./src/linker.messenger.wakeup -c release
+        dotnet pack ./src/linker.messenger.wlist -c release
+        dotnet pack ./src/linker.tun -c release
+        dotnet pack ./src/linker.nat -c release
+        dotnet pack ./src/linker.tunnel -c release
+        
+    - name: Push
+      run: |
+        dotnet nuget push ./src/linker.libs/bin/release/linker.libs.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger/bin/release/linker.messenger.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.access/bin/release/linker.messenger.access.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.action/bin/release/linker.messenger.action.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.api/bin/release/linker.messenger.api.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.channel/bin/release/linker.messenger.channel.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.decenter/bin/release/linker.messenger.decenter.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.entry/bin/release/linker.messenger.entry.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.exroute/bin/release/linker.messenger.exroute.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.flow/bin/release/linker.messenger.flow.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.forward/bin/release/linker.messenger.forward.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.listen/bin/release/linker.messenger.listen.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.logger/bin/release/linker.messenger.logger.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.pcp/bin/release/linker.messenger.pcp.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.plan/bin/release/linker.messenger.plan.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.relay/bin/release/linker.messenger.relay.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.serializer.memorypack/bin/release/linker.messenger.serializer.memorypack.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.sforward/bin/release/linker.messenger.sforward.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.signin/bin/release/linker.messenger.signin.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.socks5/bin/release/linker.messenger.socks5.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.store.file/bin/release/linker.messenger.store.file.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.sync/bin/release/linker.messenger.sync.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.tunnel/bin/release/linker.messenger.tunnel.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.tuntap/bin/release/linker.messenger.tuntap.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.updater/bin/release/linker.messenger.updater.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.firewall/bin/release/linker.messenger.firewall.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.wakeup/bin/release/linker.messenger.wakeup.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.messenger.wlist/bin/release/linker.messenger.wlist.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.tun/bin/release/linker.tun.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.nat/bin/release/linker.nat.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
+        dotnet nuget push ./src/linker.tunnel/bin/release/linker.tunnel.1.9.6.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate --api-key ${{ secrets.NUGET_KEY }} --no-symbols
