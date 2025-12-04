@@ -117,6 +117,9 @@ pub const PunchServer = struct {
     /// 已连接的客户端
     clients: std.StringHashMap(ClientInfo),
 
+    /// 客户端列表锁（多线程访问保护）
+    clients_mutex: std.Thread.Mutex = .{},
+
     /// 运行状态
     running: bool = false,
 
@@ -191,7 +194,8 @@ pub const PunchServer = struct {
 
         log.info("服务器正在停止...", .{});
 
-        // 关闭所有客户端连接，清理 TLS 资源
+        // 关闭所有客户端连接，清理 TLS 资源（加锁）
+        self.clients_mutex.lock();
         var iter = self.clients.iterator();
         while (iter.next()) |entry| {
             const client = entry.value_ptr;
@@ -206,6 +210,7 @@ pub const PunchServer = struct {
             self.allocator.free(client.machine_name);
         }
         self.clients.clearAndFree();
+        self.clients_mutex.unlock();
 
         // 关闭监听 socket
         if (self.listen_socket) |sock| {
@@ -242,12 +247,22 @@ pub const PunchServer = struct {
             const client_ep = net.Address{ .any = client_addr };
             log.info("新连接: {any}", .{client_ep});
 
-            // 处理客户端
-            self.handleClient(client_sock, client_ep) catch |e| {
-                log.err("处理客户端错误: {any}", .{e});
+            // 在新线程中处理客户端
+            const thread = std.Thread.spawn(.{}, handleClientThread, .{ self, client_sock, client_ep }) catch |e| {
+                log.err("创建客户端处理线程失败: {any}", .{e});
                 posix.close(client_sock);
+                continue;
             };
+            thread.detach();
         }
+    }
+
+    /// 客户端处理线程函数
+    fn handleClientThread(self: *Self, sock: posix.socket_t, client_ep: net.Address) void {
+        self.handleClient(sock, client_ep) catch |e| {
+            log.err("处理客户端错误: {any}", .{e});
+            posix.close(sock);
+        };
     }
 
     /// 处理客户端连接
@@ -346,8 +361,12 @@ pub const PunchServer = struct {
             .route_level = peer_info.route_level,
         };
 
-        // 存储客户端信息
-        try self.clients.put(client_info.machine_id, client_info);
+        // 存储客户端信息（加锁）
+        {
+            self.clients_mutex.lock();
+            defer self.clients_mutex.unlock();
+            try self.clients.put(client_info.machine_id, client_info);
+        }
 
         log.info("", .{});
         log.info("╔══════════════════════════════════════════════════════════════╗", .{});
@@ -370,7 +389,7 @@ pub const PunchServer = struct {
         }
         log.info("║ 路由层级: {d}", .{client_info.route_level});
         log.info("╠══════════════════════════════════════════════════════════════╣", .{});
-        log.info("║ 当前在线客户端数: {d}", .{self.clients.count()});
+        log.info("║ 当前在线客户端数: {d}", .{self.getClientCount()});
         log.info("╚══════════════════════════════════════════════════════════════╝", .{});
         log.info("", .{});
 
@@ -392,7 +411,11 @@ pub const PunchServer = struct {
 
     /// 清理客户端资源（包括 TLS 连接）
     fn cleanupClient(self: *Self, machine_id: []const u8) void {
-        if (self.clients.fetchRemove(machine_id)) |entry| {
+        self.clients_mutex.lock();
+        const maybe_entry = self.clients.fetchRemove(machine_id);
+        self.clients_mutex.unlock();
+
+        if (maybe_entry) |entry| {
             const client = entry.value;
             // 释放 TLS 连接内存
             if (client.tls_conn) |conn_ptr| {
@@ -447,12 +470,16 @@ pub const PunchServer = struct {
         var buf: [4096]u8 = undefined;
 
         while (self.running) {
-            // 获取客户端信息
-            const client_ptr = self.clients.getPtr(machine_id) orelse {
+            // 获取客户端信息（加锁）
+            self.clients_mutex.lock();
+            const client_ptr = self.clients.getPtr(machine_id);
+            self.clients_mutex.unlock();
+
+            const client = client_ptr orelse {
                 return error.ClientNotFound;
             };
 
-            const recv_len = client_ptr.recvData(&buf) catch |e| {
+            const recv_len = client.recvData(&buf) catch |e| {
                 if (e == error.WouldBlock) {
                     std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
@@ -469,8 +496,12 @@ pub const PunchServer = struct {
                 continue;
             }
 
-            // 更新活动时间
-            client_ptr.last_active = std.time.timestamp();
+            // 更新活动时间（加锁）
+            self.clients_mutex.lock();
+            if (self.clients.getPtr(machine_id)) |ptr| {
+                ptr.last_active = std.time.timestamp();
+            }
+            self.clients_mutex.unlock();
 
             // 解析消息
             const header = protocol.MessageHeader.parse(buf[0..protocol.MessageHeader.SIZE]) catch continue;
@@ -478,13 +509,13 @@ pub const PunchServer = struct {
 
             switch (header.msg_type) {
                 .heartbeat => {
-                    try self.sendHeartbeatResponseToClient(client_ptr);
+                    try self.sendHeartbeatResponseToClient(client);
                 },
                 .punch_request => {
-                    try self.handlePunchRequestWithTls(client_ptr, msg_payload);
+                    try self.handlePunchRequestWithTls(client, msg_payload);
                 },
                 .list_peers => {
-                    try self.sendPeerListToClient(client_ptr);
+                    try self.sendPeerListToClient(client);
                 },
                 else => {
                     log.debug("未知消息类型: {any}", .{header.msg_type});
@@ -525,8 +556,11 @@ pub const PunchServer = struct {
         log.info("  传输方式: {s}", .{request.transport.description()});
         log.info("========================================", .{});
 
-        // 查找目标客户端
+        // 查找目标客户端（加锁）
+        self.clients_mutex.lock();
         const target = self.clients.get(request.target_machine_id);
+        self.clients_mutex.unlock();
+
         if (target == null) {
             log.err("目标客户端不在线: {s}", .{request.target_machine_id});
             try self.sendPunchResponseToClient(from_client, false, .peer_not_found, null);
@@ -595,17 +629,23 @@ pub const PunchServer = struct {
         var count: u16 = 0;
         try writer.writeInt(u16, 0, .big); // 占位符
 
-        var iter = self.clients.iterator();
-        while (iter.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, client.machine_id)) continue;
+        // 迭代客户端列表（加锁）- 使用作用域限制锁的范围
+        {
+            self.clients_mutex.lock();
+            defer self.clients_mutex.unlock();
 
-            const peer = entry.value_ptr;
-            try writer.writeInt(u16, @intCast(peer.machine_id.len), .big);
-            try writer.writeAll(peer.machine_id);
-            try writer.writeInt(u16, @intCast(peer.machine_name.len), .big);
-            try writer.writeAll(peer.machine_name);
-            try writer.writeByte(@intFromEnum(peer.nat_type));
-            count += 1;
+            var iter = self.clients.iterator();
+            while (iter.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, client.machine_id)) continue;
+
+                const peer = entry.value_ptr;
+                try writer.writeInt(u16, @intCast(peer.machine_id.len), .big);
+                try writer.writeAll(peer.machine_id);
+                try writer.writeInt(u16, @intCast(peer.machine_name.len), .big);
+                try writer.writeAll(peer.machine_name);
+                try writer.writeByte(@intFromEnum(peer.nat_type));
+                count += 1;
+            }
         }
 
         // 回写数量
@@ -657,9 +697,13 @@ pub const PunchServer = struct {
                 continue;
             }
 
-            // 更新活动时间
-            if (self.clients.getPtr(machine_id)) |client| {
-                client.last_active = std.time.timestamp();
+            // 更新活动时间（加锁）
+            {
+                self.clients_mutex.lock();
+                defer self.clients_mutex.unlock();
+                if (self.clients.getPtr(machine_id)) |client| {
+                    client.last_active = std.time.timestamp();
+                }
             }
 
             // 解析消息
@@ -743,8 +787,12 @@ pub const PunchServer = struct {
         log.info("  传输方式: {s}", .{request.transport.description()});
         log.info("========================================", .{});
 
-        // 查找目标客户端
+        // 查找目标客户端（加锁）
+        self.clients_mutex.lock();
         const target = self.clients.get(request.target_machine_id);
+        const from_client_opt = self.clients.get(from_id);
+        self.clients_mutex.unlock();
+
         if (target == null) {
             log.err("目标客户端不在线: {s}", .{request.target_machine_id});
             try self.sendPunchResponse(sock, false, .peer_not_found, null);
@@ -753,7 +801,7 @@ pub const PunchServer = struct {
         }
 
         const target_client = target.?;
-        const from_client = self.clients.get(from_id) orelse {
+        const from_client = from_client_opt orelse {
             log.err("发起方客户端信息丢失", .{});
             return;
         };
@@ -812,17 +860,23 @@ pub const PunchServer = struct {
         var count: u16 = 0;
         try writer.writeInt(u16, 0, .big); // 占位符
 
-        var iter = self.clients.iterator();
-        while (iter.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, exclude_id)) continue;
+        // 迭代客户端列表（加锁）- 使用作用域限制锁的范围
+        {
+            self.clients_mutex.lock();
+            defer self.clients_mutex.unlock();
 
-            const client = entry.value_ptr;
-            try writer.writeInt(u16, @intCast(client.machine_id.len), .big);
-            try writer.writeAll(client.machine_id);
-            try writer.writeInt(u16, @intCast(client.machine_name.len), .big);
-            try writer.writeAll(client.machine_name);
-            try writer.writeByte(@intFromEnum(client.nat_type));
-            count += 1;
+            var iter = self.clients.iterator();
+            while (iter.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, exclude_id)) continue;
+
+                const client = entry.value_ptr;
+                try writer.writeInt(u16, @intCast(client.machine_id.len), .big);
+                try writer.writeAll(client.machine_id);
+                try writer.writeInt(u16, @intCast(client.machine_name.len), .big);
+                try writer.writeAll(client.machine_name);
+                try writer.writeByte(@intFromEnum(client.nat_type));
+                count += 1;
+            }
         }
 
         // 回写数量
@@ -851,12 +905,17 @@ pub const PunchServer = struct {
     }
 
     /// 获取在线客户端数量
-    pub fn getClientCount(self: *const Self) usize {
+    pub fn getClientCount(self: *Self) usize {
+        self.clients_mutex.lock();
+        defer self.clients_mutex.unlock();
         return self.clients.count();
     }
 
     /// 打印所有在线客户端列表（便于手动连接）
     pub fn printOnlineClients(self: *Self) void {
+        self.clients_mutex.lock();
+        defer self.clients_mutex.unlock();
+
         const count = self.clients.count();
         if (count == 0) {
             log.info("当前无在线客户端", .{});
