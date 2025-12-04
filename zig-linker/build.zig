@@ -16,6 +16,13 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    // ====== 获取 zzig 依赖 ======
+    const zzig_dep = b.dependency("zzig", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zzig = zzig_dep.module("zzig");
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -39,6 +46,10 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // 添加 zzig 依赖
+        .imports = &.{
+            .{ .name = "zzig", .module = zzig },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -79,6 +90,7 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "zig_linker", .module = mod },
+                .{ .name = "zzig", .module = zzig },
             },
         }),
     });
@@ -97,6 +109,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{
+                .{ .name = "zzig", .module = zzig },
+            },
         }),
     });
     b.installArtifact(server_exe);
@@ -118,6 +133,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{
+                .{ .name = "zzig", .module = zzig },
+            },
         }),
     });
     b.installArtifact(client_exe);
