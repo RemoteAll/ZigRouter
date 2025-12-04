@@ -214,9 +214,55 @@ pub const ConfigManager = struct {
 
     /// 释放资源
     pub fn deinit(self: *Self) void {
+        // 释放动态分配的字符串
+        if (self.config.server_addr.len > 0 and !isStaticString(self.config.server_addr)) {
+            self.allocator.free(self.config.server_addr);
+        }
+        if (self.config.machine_name.len > 0 and !isStaticString(self.config.machine_name)) {
+            self.allocator.free(self.config.machine_name);
+        }
+        if (self.config.machine_id.len > 0 and !isStaticString(self.config.machine_id)) {
+            self.allocator.free(self.config.machine_id);
+        }
+        if (self.config.stun_server.len > 0 and !isStaticString(self.config.stun_server)) {
+            self.allocator.free(self.config.stun_server);
+        }
+        if (self.config.log_level.len > 0 and !isStaticString(self.config.log_level)) {
+            self.allocator.free(self.config.log_level);
+        }
+
+        // 释放传输方式配置中的动态字符串
         if (self.config.transports.len > 0) {
+            for (self.config.transports) |t| {
+                if (t.name.len > 0 and !isStaticString(t.name)) {
+                    self.allocator.free(t.name);
+                }
+            }
             self.allocator.free(self.config.transports);
         }
+    }
+
+    /// 检查是否为静态字符串（不需要释放）
+    fn isStaticString(s: []const u8) bool {
+        // 静态字符串的指针通常在只读段，这里用简单的启发式方法
+        // 检查是否是默认值
+        const defaults = [_][]const u8{
+            "127.0.0.1",
+            "",
+            "stun.l.google.com",
+            "info",
+            "UdpPortMap",
+            "TcpPortMap",
+            "Udp",
+            "UdpP2PNAT",
+            "TcpP2PNAT",
+            "TcpNutssb",
+            "MsQuic",
+        };
+        for (defaults) |d| {
+            if (s.ptr == d.ptr) return true;
+        }
+        return false;
     }
 
     /// 加载配置文件，如果不存在则创建默认配置

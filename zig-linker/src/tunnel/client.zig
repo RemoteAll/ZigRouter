@@ -5,6 +5,7 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const zzig = @import("zzig");
 const types = @import("types.zig");
 const log = @import("log.zig");
 const net_utils = @import("net_utils.zig");
@@ -13,6 +14,34 @@ const stun = @import("stun.zig");
 const transport_mod = @import("transport.zig");
 const config_mod = @import("config.zig");
 const tls = @import("tls.zig");
+
+/// 格式化地址为可读字符串
+fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
+            writer.print("{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                std.mem.bigToNative(u16, addr.in.sa.port),
+            }) catch return "(error)";
+        },
+        posix.AF.INET6 => {
+            writer.print("[IPv6]:{d}", .{
+                std.mem.bigToNative(u16, addr.in6.sa.port),
+            }) catch return "(error)";
+        },
+        else => {
+            return "(unknown)";
+        },
+    }
+    return fbs.getWritten();
+}
 
 /// 客户端配置
 pub const ClientConfig = struct {
@@ -177,7 +206,13 @@ pub const PunchClient = struct {
         self.local_addr = .{ .any = local_sockaddr };
 
         log.info("已连接到服务器: {s}:{d}", .{ self.config.server_addr, self.config.server_port });
-        log.info("本地地址: {any}", .{self.local_addr});
+
+        // 格式化本地地址
+        if (self.local_addr) |addr| {
+            var addr_buf: [64]u8 = undefined;
+            const local_addr_str = formatAddress(addr, &addr_buf);
+            log.info("本地地址: {s}", .{local_addr_str});
+        }
 
         // 发送注册消息
         try self.register();
@@ -674,7 +709,7 @@ pub const PunchClient = struct {
 
     /// 发送心跳
     pub fn sendHeartbeat(self: *Self) !void {
-        const sock = self.server_socket orelse return error.NotConnected;
+        if (self.server_socket == null) return error.NotConnected;
 
         const header = protocol.MessageHeader{
             .magic = protocol.PROTOCOL_MAGIC,
@@ -686,7 +721,13 @@ pub const PunchClient = struct {
 
         var buf: [protocol.MessageHeader.SIZE]u8 = undefined;
         try header.serialize(&buf);
-        _ = try posix.send(sock, &buf, 0);
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(&buf);
+        } else {
+            _ = try posix.send(self.server_socket.?, &buf, 0);
+        }
     }
 
     /// 运行消息循环
@@ -707,9 +748,20 @@ pub const PunchClient = struct {
             // 设置接收超时
             net_utils.setRecvTimeout(sock, 1000) catch {};
 
-            const recv_len = posix.recv(sock, &recv_buf, 0) catch |e| {
-                if (e == error.WouldBlock) continue;
-                return e;
+            // 使用 TLS 或普通 socket 接收
+            const recv_len = if (self.tls_conn) |*tc| blk: {
+                break :blk tc.recv(&recv_buf) catch |e| {
+                    if (e == error.WouldBlock) continue;
+                    // TLS 超时也视为 WouldBlock
+                    if (e == error.ConnectionTimedOut) continue;
+                    return e;
+                };
+            } else blk: {
+                break :blk posix.recv(sock, &recv_buf, 0) catch |e| {
+                    if (e == error.WouldBlock) continue;
+                    if (e == error.ConnectionTimedOut) continue;
+                    return e;
+                };
             };
 
             if (recv_len == 0) {
@@ -915,6 +967,9 @@ pub const AutoPunchResult = struct {
 
 /// 客户端入口函数
 pub fn main() !void {
+    // 初始化控制台，支持 UTF-8 中文显示
+    zzig.Console.setup();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -946,7 +1001,14 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--server")) {
             if (i + 1 < args.len) {
-                cmd_server_addr = args[i + 1];
+                const addr_arg = args[i + 1];
+                // 支持 host:port 格式
+                if (std.mem.lastIndexOfScalar(u8, addr_arg, ':')) |colon_idx| {
+                    cmd_server_addr = addr_arg[0..colon_idx];
+                    cmd_server_port = std.fmt.parseInt(u16, addr_arg[colon_idx + 1 ..], 10) catch null;
+                } else {
+                    cmd_server_addr = addr_arg;
+                }
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {

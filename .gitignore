@@ -70,3 +70,4 @@ Desktop.ini
 secrets.*
 *.key
 *.pem
+zig-linker/punch_client.json

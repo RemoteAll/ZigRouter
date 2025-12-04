@@ -5,6 +5,7 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const zzig = @import("zzig");
 const types = @import("types.zig");
 const log = @import("log.zig");
 const net_utils = @import("net_utils.zig");
@@ -24,9 +25,9 @@ pub const ClientInfo = struct {
     local_addr: net.Address,
     /// 公网地址
     public_addr: ?net.Address = null,
-    /// socket (非 TLS 模式)
+    /// socket
     socket: posix.socket_t,
-    /// TLS 连接 (TLS 模式)
+    /// TLS 连接 (堆分配，需要手动释放)
     tls_conn: ?*tls.TlsConnection = null,
     /// 是否使用 TLS
     use_tls: bool = false,
@@ -38,6 +39,24 @@ pub const ClientInfo = struct {
     port_map_wan: u16 = 0,
     /// 路由级别
     route_level: u8 = 8,
+
+    /// 发送数据（自动处理 TLS）
+    pub fn sendData(self: *const ClientInfo, data: []const u8) !void {
+        if (self.use_tls and self.tls_conn != null) {
+            _ = try self.tls_conn.?.send(data);
+        } else {
+            _ = try posix.send(self.socket, data, 0);
+        }
+    }
+
+    /// 接收数据（自动处理 TLS）
+    pub fn recvData(self: *const ClientInfo, buffer: []u8) !usize {
+        if (self.use_tls and self.tls_conn != null) {
+            return try self.tls_conn.?.recv(buffer);
+        } else {
+            return try posix.recv(self.socket, buffer, 0);
+        }
+    }
 
     /// 格式化地址为字符串
     pub fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
@@ -172,10 +191,19 @@ pub const PunchServer = struct {
 
         log.info("服务器正在停止...", .{});
 
-        // 关闭所有客户端连接
+        // 关闭所有客户端连接，清理 TLS 资源
         var iter = self.clients.iterator();
         while (iter.next()) |entry| {
-            posix.close(entry.value_ptr.socket);
+            const client = entry.value_ptr;
+            // 释放 TLS 连接内存
+            if (client.tls_conn) |conn_ptr| {
+                self.allocator.destroy(conn_ptr);
+            }
+            // 关闭 socket
+            posix.close(client.socket);
+            // 释放分配的字符串
+            self.allocator.free(client.machine_id);
+            self.allocator.free(client.machine_name);
         }
         self.clients.clearAndFree();
 
@@ -226,49 +254,71 @@ pub const PunchServer = struct {
     fn handleClient(self: *Self, sock: posix.socket_t, client_ep: net.Address) !void {
         self.stats.total_connections += 1;
 
+        // TLS 连接（堆分配，便于存储到 ClientInfo）
+        var tls_conn_ptr: ?*tls.TlsConnection = null;
+        defer {
+            // 如果未成功注册，需要清理 TLS 连接
+            // 成功注册后由 ClientInfo 管理
+        }
+
         // 如果启用 TLS，先进行握手
-        var tls_conn: ?tls.TlsConnection = null;
         if (self.config.tls_enabled) {
-            var conn = tls.TlsConnection.initServer(sock, .{
+            // 堆分配 TLS 连接
+            const conn_ptr = try self.allocator.create(tls.TlsConnection);
+            errdefer self.allocator.destroy(conn_ptr);
+
+            conn_ptr.* = tls.TlsConnection.initServer(sock, .{
                 .enabled = true,
                 .cert_file = self.config.cert_file,
                 .key_file = self.config.key_file,
             });
-            conn.handshake() catch |e| {
+
+            conn_ptr.handshake() catch |e| {
                 log.err("TLS 握手失败: {any}", .{e});
+                self.allocator.destroy(conn_ptr);
                 return;
             };
-            tls_conn = conn;
+
+            tls_conn_ptr = conn_ptr;
             log.info("TLS 握手成功", .{});
         }
 
+        // 创建临时 ClientInfo 用于接收数据
+        var temp_client = ClientInfo{
+            .machine_id = "",
+            .machine_name = "",
+            .local_addr = client_ep,
+            .socket = sock,
+            .tls_conn = tls_conn_ptr,
+            .use_tls = self.config.tls_enabled,
+            .connected_at = std.time.timestamp(),
+            .last_active = std.time.timestamp(),
+        };
+
         // 接收注册消息
         var buf: [4096]u8 = undefined;
-        const recv_len = if (tls_conn) |*tc| blk: {
-            break :blk tc.recv(&buf) catch |e| {
-                log.err("TLS 接收注册消息失败: {any}", .{e});
-                return;
-            };
-        } else blk: {
-            break :blk posix.recv(sock, &buf, 0) catch |e| {
-                log.err("接收注册消息失败: {any}", .{e});
-                return;
-            };
+        const recv_len = temp_client.recvData(&buf) catch |e| {
+            log.err("接收注册消息失败: {any}", .{e});
+            if (tls_conn_ptr) |ptr| self.allocator.destroy(ptr);
+            return;
         };
 
         if (recv_len < protocol.MessageHeader.SIZE) {
             log.err("消息太短", .{});
+            if (tls_conn_ptr) |ptr| self.allocator.destroy(ptr);
             return;
         }
 
         // 解析消息头
         const header = protocol.MessageHeader.parse(buf[0..protocol.MessageHeader.SIZE]) catch |e| {
             log.err("解析消息头错误: {any}", .{e});
+            if (tls_conn_ptr) |ptr| self.allocator.destroy(ptr);
             return;
         };
 
         if (header.msg_type != .register) {
             log.err("第一条消息必须是注册消息，收到: {any}", .{header.msg_type});
+            if (tls_conn_ptr) |ptr| self.allocator.destroy(ptr);
             return;
         }
 
@@ -276,6 +326,7 @@ pub const PunchServer = struct {
         const payload = buf[protocol.MessageHeader.SIZE..recv_len];
         const peer_info = protocol.PeerInfo.parse(payload, self.allocator) catch |e| {
             log.err("解析注册消息失败: {any}", .{e});
+            if (tls_conn_ptr) |ptr| self.allocator.destroy(ptr);
             return;
         };
 
@@ -287,6 +338,8 @@ pub const PunchServer = struct {
             .local_addr = peer_info.local_endpoint,
             .public_addr = client_ep,
             .socket = sock,
+            .tls_conn = tls_conn_ptr,
+            .use_tls = self.config.tls_enabled,
             .connected_at = std.time.timestamp(),
             .last_active = std.time.timestamp(),
             .port_map_wan = peer_info.port_map_wan,
@@ -324,20 +377,265 @@ pub const PunchServer = struct {
         // 打印所有在线客户端列表
         self.printOnlineClients();
 
-        // 发送注册成功响应
-        try self.sendRegisterResponse(sock, true, client_info.machine_id);
+        // 发送注册成功响应（使用新注册的客户端信息）
+        try self.sendRegisterResponseToClient(&client_info);
 
         // 进入消息处理循环
-        self.handleClientMessages(sock, client_info.machine_id) catch |e| {
+        self.handleClientMessagesWithTls(client_info.machine_id) catch |e| {
             log.err("客户端消息处理错误: {any}", .{e});
         };
 
         // 客户端断开，清理
         log.info("客户端断开: {s}", .{client_info.machine_id});
-        _ = self.clients.remove(client_info.machine_id);
+        self.cleanupClient(client_info.machine_id);
     }
 
-    /// 处理客户端消息
+    /// 清理客户端资源（包括 TLS 连接）
+    fn cleanupClient(self: *Self, machine_id: []const u8) void {
+        if (self.clients.fetchRemove(machine_id)) |entry| {
+            const client = entry.value;
+            // 释放 TLS 连接内存
+            if (client.tls_conn) |conn_ptr| {
+                self.allocator.destroy(conn_ptr);
+            }
+            // 关闭 socket
+            posix.close(client.socket);
+            // 释放 ID 和名称字符串
+            self.allocator.free(client.machine_id);
+            self.allocator.free(client.machine_name);
+        }
+    }
+
+    /// 发送注册响应给客户端（使用 TLS）
+    fn sendRegisterResponseToClient(self: *Self, client: *const ClientInfo) !void {
+        _ = self;
+        // 构建 payload
+        var payload_buf: [256]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const payload_writer = payload_stream.writer();
+
+        try payload_writer.writeByte(1); // success = true
+        try payload_writer.writeInt(u16, @intCast(client.machine_id.len), .big);
+        try payload_writer.writeAll(client.machine_id);
+
+        const payload = payload_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .register_response,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        // 合并 header 和 payload 到一个缓冲区后一次性发送（TLS 需要一次性发送）
+        var send_buf: [512]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        try client.sendData(send_buf[0..total_len]);
+
+        log.debug("已发送注册响应给 {s}，TLS: {}, 长度: {}", .{ client.machine_id, client.use_tls, total_len });
+    }
+
+    /// 处理客户端消息（使用 TLS）
+    fn handleClientMessagesWithTls(self: *Self, machine_id: []const u8) !void {
+        var buf: [4096]u8 = undefined;
+
+        while (self.running) {
+            // 获取客户端信息
+            const client_ptr = self.clients.getPtr(machine_id) orelse {
+                return error.ClientNotFound;
+            };
+
+            const recv_len = client_ptr.recvData(&buf) catch |e| {
+                if (e == error.WouldBlock) {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                }
+                return e;
+            };
+
+            if (recv_len == 0) {
+                // 连接关闭
+                return;
+            }
+
+            if (recv_len < protocol.MessageHeader.SIZE) {
+                continue;
+            }
+
+            // 更新活动时间
+            client_ptr.last_active = std.time.timestamp();
+
+            // 解析消息
+            const header = protocol.MessageHeader.parse(buf[0..protocol.MessageHeader.SIZE]) catch continue;
+            const msg_payload = buf[protocol.MessageHeader.SIZE..recv_len];
+
+            switch (header.msg_type) {
+                .heartbeat => {
+                    try self.sendHeartbeatResponseToClient(client_ptr);
+                },
+                .punch_request => {
+                    try self.handlePunchRequestWithTls(client_ptr, msg_payload);
+                },
+                .list_peers => {
+                    try self.sendPeerListToClient(client_ptr);
+                },
+                else => {
+                    log.debug("未知消息类型: {any}", .{header.msg_type});
+                },
+            }
+        }
+    }
+
+    /// 发送心跳响应（使用 TLS）
+    fn sendHeartbeatResponseToClient(self: *Self, client: *const ClientInfo) !void {
+        _ = self;
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .heartbeat_response,
+            .data_length = 0,
+            .sequence = 0,
+        };
+
+        var buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&buf);
+        try client.sendData(&buf);
+    }
+
+    /// 处理打洞请求（使用 TLS）
+    fn handlePunchRequestWithTls(self: *Self, from_client: *const ClientInfo, payload: []const u8) !void {
+        self.stats.total_punch_requests += 1;
+
+        const request = protocol.PunchRequest.parse(payload) orelse {
+            log.err("解析打洞请求失败", .{});
+            return;
+        };
+
+        log.info("========================================", .{});
+        log.info("  收到打洞请求", .{});
+        log.info("  发起方: {s}", .{from_client.machine_id});
+        log.info("  目标方: {s}", .{request.target_machine_id});
+        log.info("  传输方式: {s}", .{request.transport.description()});
+        log.info("========================================", .{});
+
+        // 查找目标客户端
+        const target = self.clients.get(request.target_machine_id);
+        if (target == null) {
+            log.err("目标客户端不在线: {s}", .{request.target_machine_id});
+            try self.sendPunchResponseToClient(from_client, false, .peer_not_found, null);
+            self.stats.failed_punches += 1;
+            return;
+        }
+
+        const target_client = target.?;
+
+        // 检查 NAT 类型兼容性
+        const can_p2p = from_client.nat_type.canP2P(target_client.nat_type);
+        if (!can_p2p and request.transport != .tcp_port_map and request.transport != .udp_port_map) {
+            log.warn("NAT 类型不兼容，可能无法打洞成功", .{});
+            log.warn("  发起方 NAT: {s}", .{from_client.nat_type.description()});
+            log.warn("  目标方 NAT: {s}", .{target_client.nat_type.description()});
+        }
+
+        // 发送打洞成功响应
+        try self.sendPunchResponseToClient(from_client, true, .success, null);
+
+        log.info("已通知双方开始打洞", .{});
+    }
+
+    /// 发送打洞响应（使用 TLS）
+    fn sendPunchResponseToClient(self: *Self, client: *const ClientInfo, success: bool, error_code: protocol.ErrorCode, connection_info: ?[]const u8) !void {
+        _ = self;
+        var payload_buf: [256]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        try writer.writeByte(if (success) 1 else 0);
+        try writer.writeInt(u16, @intFromEnum(error_code), .big);
+
+        if (connection_info) |info| {
+            try writer.writeAll(info);
+        }
+
+        const payload = payload_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .punch_response,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        // 合并 header 和 payload 后一次性发送
+        var send_buf: [512]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        try client.sendData(send_buf[0..total_len]);
+    }
+
+    /// 发送在线客户端列表（使用 TLS）
+    fn sendPeerListToClient(self: *Self, client: *const ClientInfo) !void {
+        var payload_buf: [4096]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        var count: u16 = 0;
+        try writer.writeInt(u16, 0, .big); // 占位符
+
+        var iter = self.clients.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, client.machine_id)) continue;
+
+            const peer = entry.value_ptr;
+            try writer.writeInt(u16, @intCast(peer.machine_id.len), .big);
+            try writer.writeAll(peer.machine_id);
+            try writer.writeInt(u16, @intCast(peer.machine_name.len), .big);
+            try writer.writeAll(peer.machine_name);
+            try writer.writeByte(@intFromEnum(peer.nat_type));
+            count += 1;
+        }
+
+        // 回写数量
+        const payload = payload_stream.getWritten();
+        const count_bytes = std.mem.toBytes(std.mem.nativeToBig(u16, count));
+        var payload_mutable: [4096]u8 = undefined;
+        @memcpy(payload_mutable[0..payload.len], payload);
+        @memcpy(payload_mutable[0..2], &count_bytes);
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .list_peers_response,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        // 合并 header 和 payload 后一次性发送
+        var send_buf: [4352]u8 = undefined; // 4096 + 256
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload_mutable[0..payload.len]);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        try client.sendData(send_buf[0..total_len]);
+    }
+
+    /// 处理客户端消息（旧版，未使用 TLS，保留以供参考）
     fn handleClientMessages(self: *Self, sock: posix.socket_t, machine_id: []const u8) !void {
         var buf: [4096]u8 = undefined;
 
@@ -625,6 +923,9 @@ pub const PunchServer = struct {
 
 /// 服务器入口函数
 pub fn main() !void {
+    // 初始化控制台，支持 UTF-8 中文显示
+    zzig.Console.setup();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

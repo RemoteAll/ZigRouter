@@ -291,6 +291,11 @@ pub const TlsConnection = struct {
             return TlsError.InvalidData;
         }
 
+        // 检查数据长度是否超过缓冲区大小
+        if (total_len > 16384) {
+            return TlsError.InvalidData;
+        }
+
         const ciphertext_len = total_len - 16;
 
         // 接收密文和 tag
