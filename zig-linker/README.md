@@ -20,10 +20,36 @@
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| UPnP IGD | ✅ 已实现 | 自动端口映射（SSDP + SOAP） |
+| UPnP IGD | ✅ 已实现 | 自动端口映射（SSDP + SOAP），支持 IPv4/IPv6 |
 | NAT-PMP | ✅ 已实现 | Apple 轻量级端口映射协议 |
 | XML 解析器 | ✅ 已实现 | 解析 UPnP SOAP 响应 |
-| STUN | ✅ 已实现 | NAT 类型检测 |
+| STUN | ✅ 已实现 | NAT 类型检测，支持 IPv4/IPv6 |
+| IPv6 支持 | ✅ 已实现 | 完整的 IPv4/IPv6 双栈支持 |
+
+### IPv6 支持
+
+本库提供完整的 IPv4/IPv6 双栈支持：
+
+**网络工具 (net_utils.zig)**：
+- `isIPv4()` / `isIPv6()` - 地址类型检测
+- `isIPv6LinkLocal()` - 链路本地地址检测 (fe80::/10)
+- `isIPv6GlobalUnicast()` - 全局单播地址检测 (2000::/3)
+- `isIPv6UniqueLocal()` - 唯一本地地址检测 (fc00::/7)
+- `isIPv4MappedIPv6()` - IPv4 映射地址检测 (::ffff:x.x.x.x)
+- `getLocalOutboundAddressV6()` - 获取本机 IPv6 出口地址
+- `createDualStackUdpSocket()` / `createDualStackTcpSocket()` - 创建双栈 Socket
+- `convertMappedAddress()` / `convertToIPv4MappedIPv6()` - 地址转换
+
+**UPnP IGD (upnp.zig)**：
+- IPv6 SSDP 发现支持
+  - 链路本地组播: `ff02::c`
+  - 站点本地组播: `ff05::c`
+- 自动双栈发现（先 IPv4 后 IPv6）
+- `PortMapper.initWithIPv6()` - 指定 IPv6 配置
+
+**STUN (stun.zig)**：
+- 支持 IPv4 和 IPv6 映射地址解析
+- XOR-MAPPED-ADDRESS IPv6 支持 (RFC 5389)
 
 ### MsQuic 未实现说明
 
@@ -56,11 +82,11 @@ src/
 └── tunnel/
     ├── types.zig     # 类型定义（NAT 类型、传输类型等）
     ├── log.zig       # 日志系统
-    ├── net_utils.zig # 网络工具（Socket 操作、端口复用等）
-    ├── stun.zig      # STUN 协议实现（NAT 类型检测）
+    ├── net_utils.zig # 网络工具（Socket 操作、端口复用、IPv6 支持等）
+    ├── stun.zig      # STUN 协议实现（NAT 类型检测，支持 IPv6）
     ├── protocol.zig  # 通信协议定义
     ├── transport.zig # 7 种打洞传输方式实现
-    ├── upnp.zig      # UPnP IGD 和 NAT-PMP 自动端口映射
+    ├── upnp.zig      # UPnP IGD 和 NAT-PMP 自动端口映射（支持 IPv6）
     ├── server.zig    # 打洞信令服务器
     └── client.zig    # 打洞客户端
 ```
@@ -132,7 +158,7 @@ punch_client -s 服务器IP -t 目标节点ID -m tcp-map
 
 打洞过程会输出详细日志，包含：
 - 双方 NAT 类型
-- 本地/公网 IP 和端口
+- 本地/公网 IP 和端口（支持 IPv4/IPv6）
 - 打洞尝试过程
 - 连接结果和耗时
 
@@ -145,7 +171,7 @@ punch_client -s 服务器IP -t 目标节点ID -m tcp-map
 
 - [ ] 实现 MsQuic 传输方式
 - [x] 添加 UPnP/NAT-PMP 自动端口映射
-- [ ] 支持 IPv6
+- [x] 支持 IPv6
 - [ ] 添加中继服务器（Relay）支持
 - [ ] 性能优化和压力测试
 

@@ -6,7 +6,7 @@
 //! 3. PCP - NAT-PMP 的后继协议 (RFC 6887)
 //!
 //! UPnP IGD 协议流程：
-//! 1. SSDP 发现 - 通过 UDP 组播搜索网关设备
+//! 1. SSDP 发现 - 通过 UDP 组播搜索网关设备 (支持 IPv4 和 IPv6)
 //! 2. 获取设备描述 - HTTP GET 获取 XML 描述
 //! 3. SOAP 请求 - 添加/删除/查询端口映射
 //!
@@ -14,8 +14,13 @@
 //! 1. 获取外部 IP - 发送 opcode 0 请求
 //! 2. 端口映射 - 发送 opcode 1(UDP)/2(TCP) 请求
 //!
+//! IPv6 SSDP 组播地址：
+//! - ff02::c (link-local scope) - 本地链路范围
+//! - ff05::c (site-local scope) - 站点范围
+//!
 //! 参考：
 //! - UPnP Device Architecture 1.0
+//! - UPnP Device Architecture 2.0 (支持 IPv6)
 //! - WANIPConnection:1 Service Template
 //! - RFC 6886 (NAT-PMP)
 //! - RFC 6887 (PCP)
@@ -23,10 +28,19 @@
 const std = @import("std");
 const net = std.net;
 const log = @import("log.zig");
+const net_utils = @import("net_utils.zig");
 
-/// SSDP 组播地址
-const SSDP_ADDR = "239.255.255.250";
+/// SSDP IPv4 组播地址
+const SSDP_ADDR_V4 = "239.255.255.250";
+/// SSDP IPv6 链路本地组播地址
+const SSDP_ADDR_V6_LINK_LOCAL = "ff02::c";
+/// SSDP IPv6 站点本地组播地址
+const SSDP_ADDR_V6_SITE_LOCAL = "ff05::c";
+/// SSDP 端口
 const SSDP_PORT: u16 = 1900;
+
+/// 兼容旧代码的 SSDP_ADDR 别名
+const SSDP_ADDR = SSDP_ADDR_V4;
 
 /// NAT-PMP 端口
 const NATPMP_PORT: u16 = 5351;
@@ -568,11 +582,15 @@ pub const UpnpClient = struct {
     allocator: std.mem.Allocator,
     /// 已发现的设备
     device: ?DeviceInfo = null,
-    /// 本地 IP 地址
+    /// 本地 IP 地址 (IPv4 或 IPv6)
     local_ip: [46]u8 = [_]u8{0} ** 46,
     local_ip_len: usize = 0,
     /// 发现超时 (毫秒)
     discovery_timeout_ms: u32 = 3000,
+    /// 是否使用 IPv6 进行发现
+    use_ipv6: bool = false,
+    /// 是否尝试双栈发现 (先 IPv4 再 IPv6)
+    dual_stack_discovery: bool = true,
 
     const Self = @This();
 
@@ -601,9 +619,28 @@ pub const UpnpClient = struct {
         return self.local_ip[0..self.local_ip_len];
     }
 
-    /// 发现 UPnP 网关设备
+    /// 发现 UPnP 网关设备（支持 IPv4 和 IPv6）
     pub fn discover(self: *Self) !void {
         log.info("开始 UPnP 设备发现...", .{});
+
+        // 如果启用双栈发现，先尝试 IPv4，再尝试 IPv6
+        if (self.dual_stack_discovery) {
+            // 尝试 IPv4 发现
+            self.discoverV4() catch |err| {
+                log.debug("IPv4 UPnP 发现失败: {}, 尝试 IPv6...", .{err});
+                // 尝试 IPv6 发现
+                try self.discoverV6();
+            };
+        } else if (self.use_ipv6) {
+            try self.discoverV6();
+        } else {
+            try self.discoverV4();
+        }
+    }
+
+    /// IPv4 SSDP 发现
+    fn discoverV4(self: *Self) !void {
+        log.debug("开始 IPv4 SSDP 发现...", .{});
 
         // 创建 UDP socket
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
@@ -617,16 +654,16 @@ pub const UpnpClient = struct {
         try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 
         // 构建 SSDP M-SEARCH 请求
-        const search_request = buildSsdpSearchRequest();
+        const search_request = buildSsdpSearchRequestV4();
 
-        // 发送到组播地址
-        const ssdp_addr = net.Address.parseIp4(SSDP_ADDR, SSDP_PORT) catch unreachable;
+        // 发送到 IPv4 组播地址
+        const ssdp_addr = net.Address.parseIp4(SSDP_ADDR_V4, SSDP_PORT) catch unreachable;
         _ = std.posix.sendto(sock, search_request, 0, &ssdp_addr.any, ssdp_addr.getOsSockLen()) catch |err| {
-            log.err("发送 SSDP 请求失败: {}", .{err});
+            log.err("发送 SSDP IPv4 请求失败: {}", .{err});
             return UpnpError.NetworkError;
         };
 
-        log.debug("已发送 SSDP M-SEARCH 请求", .{});
+        log.debug("已发送 SSDP M-SEARCH 请求 (IPv4)", .{});
 
         // 接收响应
         var recv_buf: [2048]u8 = undefined;
@@ -637,33 +674,114 @@ pub const UpnpClient = struct {
 
         const recv_len = recv_result catch |err| {
             if (err == error.WouldBlock) {
-                log.warn("UPnP 设备发现超时", .{});
+                log.warn("UPnP IPv4 设备发现超时", .{});
                 return UpnpError.DiscoveryTimeout;
             }
-            log.err("接收 SSDP 响应失败: {}", .{err});
+            log.err("接收 SSDP IPv4 响应失败: {}", .{err});
             return UpnpError.NetworkError;
         };
 
-        log.debug("收到 SSDP 响应 {} 字节", .{recv_len});
+        log.debug("收到 SSDP IPv4 响应 {} 字节", .{recv_len});
 
         // 解析响应获取设备 URL
         const response = recv_buf[0..recv_len];
         const location = try parseSsdpLocation(response);
 
-        log.info("发现设备: {s}", .{location});
+        log.info("发现设备 (IPv4): {s}", .{location});
 
         // 获取设备描述
         try self.fetchDeviceDescription(location);
     }
 
-    /// 构建 SSDP M-SEARCH 请求
-    fn buildSsdpSearchRequest() []const u8 {
+    /// IPv6 SSDP 发现
+    fn discoverV6(self: *Self) !void {
+        log.debug("开始 IPv6 SSDP 发现...", .{});
+
+        // 创建 IPv6 UDP socket
+        const sock = try std.posix.socket(std.posix.AF.INET6, std.posix.SOCK.DGRAM, 0);
+        defer std.posix.close(sock);
+
+        // 设置超时
+        const timeout = std.posix.timeval{
+            .sec = @intCast(self.discovery_timeout_ms / 1000),
+            .usec = @intCast((self.discovery_timeout_ms % 1000) * 1000),
+        };
+        try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+
+        // 构建 IPv6 SSDP M-SEARCH 请求
+        const search_request = buildSsdpSearchRequestV6();
+
+        // 先尝试链路本地组播地址
+        var discovered = false;
+        const ssdp_addrs = [_][]const u8{ SSDP_ADDR_V6_LINK_LOCAL, SSDP_ADDR_V6_SITE_LOCAL };
+
+        for (ssdp_addrs) |addr_str| {
+            const ssdp_addr = net.Address.parseIp6(addr_str, SSDP_PORT) catch continue;
+            _ = std.posix.sendto(sock, search_request, 0, &ssdp_addr.any, ssdp_addr.getOsSockLen()) catch |err| {
+                log.debug("发送 SSDP IPv6 请求到 {s} 失败: {}", .{ addr_str, err });
+                continue;
+            };
+
+            log.debug("已发送 SSDP M-SEARCH 请求到 {s} (IPv6)", .{addr_str});
+
+            // 接收响应
+            var recv_buf: [2048]u8 = undefined;
+            var from_addr: std.posix.sockaddr.in6 = undefined;
+            var from_len: std.posix.socklen_t = @sizeOf(@TypeOf(from_addr));
+
+            const recv_result = std.posix.recvfrom(sock, &recv_buf, 0, @ptrCast(&from_addr), &from_len);
+
+            const recv_len = recv_result catch |err| {
+                if (err == error.WouldBlock) {
+                    log.debug("SSDP IPv6 发现超时 (地址: {s})", .{addr_str});
+                    continue;
+                }
+                continue;
+            };
+
+            log.debug("收到 SSDP IPv6 响应 {} 字节", .{recv_len});
+
+            // 解析响应获取设备 URL
+            const response = recv_buf[0..recv_len];
+            const location = parseSsdpLocation(response) catch continue;
+
+            log.info("发现设备 (IPv6): {s}", .{location});
+
+            // 获取设备描述
+            self.fetchDeviceDescription(location) catch continue;
+            discovered = true;
+            break;
+        }
+
+        if (!discovered) {
+            log.warn("UPnP IPv6 设备发现失败", .{});
+            return UpnpError.DiscoveryTimeout;
+        }
+    }
+
+    /// 构建 IPv4 SSDP M-SEARCH 请求
+    fn buildSsdpSearchRequestV4() []const u8 {
         return "M-SEARCH * HTTP/1.1\r\n" ++
             "HOST: 239.255.255.250:1900\r\n" ++
             "MAN: \"ssdp:discover\"\r\n" ++
             "MX: 3\r\n" ++
             "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n" ++
             "\r\n";
+    }
+
+    /// 构建 IPv6 SSDP M-SEARCH 请求
+    fn buildSsdpSearchRequestV6() []const u8 {
+        return "M-SEARCH * HTTP/1.1\r\n" ++
+            "HOST: [ff02::c]:1900\r\n" ++
+            "MAN: \"ssdp:discover\"\r\n" ++
+            "MX: 3\r\n" ++
+            "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n" ++
+            "\r\n";
+    }
+
+    /// 兼容旧代码的别名
+    fn buildSsdpSearchRequest() []const u8 {
+        return buildSsdpSearchRequestV4();
     }
 
     /// 解析 SSDP 响应中的 LOCATION 字段
@@ -1211,6 +1329,7 @@ pub const UpnpManager = struct {
 
 /// 综合端口映射管理器
 /// 自动选择 UPnP IGD 或 NAT-PMP 协议
+/// 支持 IPv4 和 IPv6 双栈发现
 pub const PortMapper = struct {
     allocator: std.mem.Allocator,
     /// UPnP 客户端
@@ -1221,6 +1340,10 @@ pub const PortMapper = struct {
     active_protocol: ProtocolType = .none,
     /// 映射列表
     mappings: std.ArrayList(MappingEntry),
+    /// 是否使用 IPv6
+    use_ipv6: bool = false,
+    /// 是否尝试双栈发现
+    dual_stack: bool = true,
 
     const Self = @This();
 
@@ -1250,6 +1373,16 @@ pub const PortMapper = struct {
         };
     }
 
+    /// 初始化（指定 IPv6 配置）
+    pub fn initWithIPv6(allocator: std.mem.Allocator, use_ipv6: bool, dual_stack: bool) Self {
+        var self = init(allocator);
+        self.use_ipv6 = use_ipv6;
+        self.dual_stack = dual_stack;
+        self.upnp_client.use_ipv6 = use_ipv6;
+        self.upnp_client.dual_stack_discovery = dual_stack;
+        return self;
+    }
+
     /// 释放资源
     pub fn deinit(self: *Self) void {
         // 删除所有映射
@@ -1261,24 +1394,27 @@ pub const PortMapper = struct {
         self.natpmp_client.deinit();
     }
 
-    /// 自动发现并选择可用协议
+    /// 自动发现并选择可用协议（支持 IPv4 和 IPv6）
     pub fn discover(self: *Self) !void {
-        log.info("开始自动发现端口映射协议...", .{});
+        log.info("开始自动发现端口映射协议 (IPv6={}, DualStack={})...", .{ self.use_ipv6, self.dual_stack });
 
-        // 首先尝试 NAT-PMP（更轻量）
-        self.natpmp_client.detectGateway() catch {
-            log.debug("NAT-PMP 不可用", .{});
-        };
+        // 首先尝试 NAT-PMP（更轻量，目前只支持 IPv4）
+        // 注：NAT-PMP 标准不支持 IPv6，PCP (RFC 6887) 是其 IPv6 后继协议
+        if (!self.use_ipv6 or self.dual_stack) {
+            self.natpmp_client.detectGateway() catch {
+                log.debug("NAT-PMP 不可用", .{});
+            };
 
-        if (self.natpmp_client.gateway_addr_len > 0) {
-            if (self.natpmp_client.getExternalIPAddress()) |_| {
-                self.active_protocol = .natpmp;
-                log.info("使用 NAT-PMP 协议", .{});
-                return;
-            } else |_| {}
+            if (self.natpmp_client.gateway_addr_len > 0) {
+                if (self.natpmp_client.getExternalIPAddress()) |_| {
+                    self.active_protocol = .natpmp;
+                    log.info("使用 NAT-PMP 协议", .{});
+                    return;
+                } else |_| {}
+            }
         }
 
-        // 然后尝试 UPnP
+        // 然后尝试 UPnP（支持 IPv4 和 IPv6）
         self.upnp_client.discover() catch |err| {
             log.debug("UPnP 不可用: {}", .{err});
             return err;
