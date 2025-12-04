@@ -754,12 +754,21 @@ pub const PunchClient = struct {
                     if (e == error.WouldBlock) continue;
                     // TLS 超时也视为 WouldBlock
                     if (e == error.ConnectionTimedOut) continue;
+                    // 连接被重置
+                    if (e == error.ConnectionResetByPeer) {
+                        log.warn("连接被服务器重置", .{});
+                        return error.ConnectionClosed;
+                    }
                     return e;
                 };
             } else blk: {
                 break :blk posix.recv(sock, &recv_buf, 0) catch |e| {
                     if (e == error.WouldBlock) continue;
                     if (e == error.ConnectionTimedOut) continue;
+                    if (e == error.ConnectionResetByPeer) {
+                        log.warn("连接被服务器重置", .{});
+                        return error.ConnectionClosed;
+                    }
                     return e;
                 };
             };
