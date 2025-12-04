@@ -8,7 +8,7 @@
 //! 4. TcpNutssb - TCP 低TTL打洞
 //! 5. UdpPortMap - UDP 端口映射
 //! 6. TcpPortMap - TCP 端口映射
-//! 7. MsQuic - QUIC 协议 (暂未实现)
+//! 7. QUIC - QUIC 协议（纯 Zig 实现）
 //!
 //! 辅助功能：
 //! - UPnP IGD 自动端口映射
@@ -26,6 +26,12 @@ pub const server = @import("tunnel/server.zig");
 pub const client = @import("tunnel/client.zig");
 pub const upnp = @import("tunnel/upnp.zig");
 
+// QUIC 协议模块（纯 Zig 实现，无外部依赖）
+pub const quic = @import("quic/quic.zig");
+
+// QUIC 打洞传输（集成到 NAT 穿透框架）
+pub const quic_transport = @import("tunnel/quic_transport.zig");
+
 /// 库版本
 pub const version = "0.1.0";
 
@@ -39,7 +45,7 @@ pub fn bufferedPrint() !void {
     std.debug.print("  4. TcpNutssb (TCP with low TTL)\n", .{});
     std.debug.print("  5. UdpPortMap (UDP port mapping)\n", .{});
     std.debug.print("  6. TcpPortMap (TCP port mapping)\n", .{});
-    std.debug.print("  7. MsQuic (QUIC protocol - not implemented)\n", .{});
+    std.debug.print("  7. QUIC (QUIC protocol - pure Zig implementation)\n", .{});
     std.debug.print("\nAuxiliary features:\n", .{});
     std.debug.print("  - UPnP IGD (Auto port mapping)\n", .{});
 }
