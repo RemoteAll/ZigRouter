@@ -12,6 +12,7 @@ const protocol = @import("protocol.zig");
 const stun = @import("stun.zig");
 const transport_mod = @import("transport.zig");
 const config_mod = @import("config.zig");
+const tls = @import("tls.zig");
 
 /// 客户端配置
 pub const ClientConfig = struct {
@@ -33,6 +34,10 @@ pub const ClientConfig = struct {
     stun_port: u16 = 19302,
     /// 自动检测 NAT 类型
     auto_detect_nat: bool = true,
+    /// 是否启用 TLS 加密
+    tls_enabled: bool = true,
+    /// 是否跳过服务器证书验证（用于自签名证书）
+    tls_skip_verify: bool = false,
 };
 
 /// 打洞结果
@@ -63,6 +68,9 @@ pub const PunchClient = struct {
 
     /// 连接到服务器的 socket
     server_socket: ?posix.socket_t = null,
+
+    /// TLS 连接
+    tls_conn: ?tls.TlsConnection = null,
 
     /// 本机 NAT 类型
     local_nat_type: types.NatType = .unknown,
@@ -115,6 +123,12 @@ pub const PunchClient = struct {
         log.info("  打洞客户端启动中...", .{});
         log.info("========================================", .{});
 
+        if (self.config.tls_enabled) {
+            log.info("  TLS 加密: 已启用", .{});
+        } else {
+            log.warn("  TLS 加密: 已禁用 (不建议在公网使用)", .{});
+        }
+
         // 检测 NAT 类型
         if (self.config.auto_detect_nat) {
             try self.detectNatType();
@@ -140,6 +154,22 @@ pub const PunchClient = struct {
 
         self.server_socket = sock;
 
+        // 如果启用 TLS，进行握手
+        if (self.config.tls_enabled) {
+            var conn = tls.TlsConnection.initClient(sock, .{
+                .enabled = true,
+                // skip_verify 取反为 verify_peer
+                .verify_peer = !self.config.tls_skip_verify,
+                .server_name = self.config.server_addr,
+            });
+            conn.handshake() catch |e| {
+                log.err("TLS 握手失败: {any}", .{e});
+                return e;
+            };
+            self.tls_conn = conn;
+            log.info("TLS 握手成功，连接已加密", .{});
+        }
+
         // 获取本地地址
         var local_sockaddr: posix.sockaddr = undefined;
         var local_len: posix.socklen_t = @sizeOf(posix.sockaddr);
@@ -155,10 +185,13 @@ pub const PunchClient = struct {
 
     /// 断开连接
     pub fn disconnect(self: *Self) void {
-        if (self.server_socket) |sock| {
+        if (self.tls_conn) |*tc| {
+            tc.close();
+            self.tls_conn = null;
+        } else if (self.server_socket) |sock| {
             posix.close(sock);
-            self.server_socket = null;
         }
+        self.server_socket = null;
         self.registered = false;
     }
 
@@ -225,12 +258,26 @@ pub const PunchClient = struct {
         var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
         try header.serialize(&header_buf);
 
-        _ = try posix.send(sock, &header_buf, 0);
-        _ = try posix.send(sock, payload, 0);
+        // 合并 header 和 payload 为一次发送
+        var send_buf: [4096]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 发送数据（使用 TLS 或普通 socket）
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(send_buf[0..total_len]);
+        } else {
+            _ = try posix.send(sock, send_buf[0..total_len], 0);
+        }
 
         // 等待响应
         var recv_buf: [256]u8 = undefined;
-        const recv_len = try posix.recv(sock, &recv_buf, 0);
+        const recv_len = if (self.tls_conn) |*tc| blk: {
+            break :blk try tc.recv(&recv_buf);
+        } else blk: {
+            break :blk try posix.recv(sock, &recv_buf, 0);
+        };
 
         if (recv_len < protocol.MessageHeader.SIZE) {
             return error.ProtocolError;
@@ -263,6 +310,9 @@ pub const PunchClient = struct {
 
         log.info("========================================", .{});
         log.info("  注册成功!", .{});
+        if (self.config.tls_enabled) {
+            log.info("  连接状态: TLS 加密", .{});
+        }
         log.info("  分配 ID: {s}", .{self.assigned_id});
         log.info("  NAT 类型: {s}", .{self.local_nat_type.description()});
         if (self.public_addr) |pub_addr| {
@@ -881,6 +931,9 @@ pub fn main() !void {
     var cmd_server_addr: ?[]const u8 = null;
     var cmd_server_port: ?u16 = null;
     var cmd_machine_name: ?[]const u8 = null;
+    // TLS 相关命令行参数
+    var cmd_tls_enabled: ?bool = null;
+    var cmd_tls_skip_verify: ?bool = null;
 
     // 简单参数解析
     var i: usize = 1;
@@ -920,6 +973,15 @@ pub fn main() !void {
             auto_mode = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
             list_only = true;
+        } else if (std.mem.eql(u8, arg, "--tls")) {
+            // 启用 TLS
+            cmd_tls_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--no-tls")) {
+            // 禁用 TLS
+            cmd_tls_enabled = false;
+        } else if (std.mem.eql(u8, arg, "--skip-verify") or std.mem.eql(u8, arg, "-k")) {
+            // 跳过证书验证 (类似 curl -k)
+            cmd_tls_skip_verify = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
@@ -949,6 +1011,10 @@ pub fn main() !void {
         .stun_server = config_manager.config.stun_server,
         .stun_port = config_manager.config.stun_port,
         .auto_detect_nat = config_manager.config.auto_detect_nat,
+        // TLS 配置：命令行参数优先于配置文件
+        // skip_verify 是 verify_server 的反向逻辑
+        .tls_enabled = cmd_tls_enabled orelse config_manager.config.tls.enabled,
+        .tls_skip_verify = cmd_tls_skip_verify orelse !config_manager.config.tls.verify_server,
     };
 
     log.info("", .{});
@@ -1084,11 +1150,17 @@ fn printUsage() void {
         \\                          quic      - MsQuic
         \\  -a, --auto            自动模式 (按配置顺序尝试所有打洞方式)
         \\  -l, --list            列出在线节点
+        \\
+        \\TLS 选项:
+        \\  --tls                 强制启用 TLS 加密 (默认已启用)
+        \\  --no-tls              禁用 TLS 加密 (仅用于本地调试)
+        \\  -k, --skip-verify     跳过服务器证书验证 (用于自签名证书)
+        \\
         \\  -h, --help            显示帮助信息
         \\
         \\配置文件说明:
         \\  首次运行时会自动生成默认配置文件 punch_client.json
-        \\  配置文件包含服务器设置、NAT 设置和打洞方式优先级
+        \\  配置文件包含服务器设置、NAT 设置、TLS 设置和打洞方式优先级
         \\  可编辑配置文件调整打洞方式的启用状态和优先级
         \\
         \\示例:
@@ -1109,6 +1181,12 @@ fn printUsage() void {
         \\
         \\  # 命令行参数覆盖配置文件
         \\  client -s 192.168.1.100 -p 7891 -n "我的电脑"
+        \\
+        \\  # 使用自签名证书连接 (跳过验证)
+        \\  client -s example.com -k
+        \\
+        \\  # 本地调试禁用 TLS
+        \\  client -s 127.0.0.1 --no-tls
         \\
     ;
     std.debug.print("{s}", .{usage});

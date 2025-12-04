@@ -19,6 +19,22 @@ pub const TransportConfig = struct {
     retry_count: u8 = 3,
 };
 
+/// TLS 配置
+pub const TlsConfiguration = struct {
+    /// 是否启用 TLS 加密
+    enabled: bool = true,
+    /// 是否验证服务器证书
+    verify_server: bool = false,
+    /// 是否允许自签名证书
+    allow_self_signed: bool = true,
+    /// CA 证书路径（留空则使用系统证书）
+    ca_cert_file: []const u8 = "",
+    /// 客户端证书路径（双向认证时使用）
+    client_cert_file: []const u8 = "",
+    /// 客户端私钥路径（双向认证时使用）
+    client_key_file: []const u8 = "",
+};
+
 /// 客户端配置
 pub const ClientConfiguration = struct {
     /// 配置文件版本
@@ -57,6 +73,9 @@ pub const ClientConfiguration = struct {
     log_level: []const u8 = "info",
     /// 是否启用彩色日志
     log_color: bool = true,
+
+    /// TLS 加密配置
+    tls: TlsConfiguration = .{},
 
     /// 打洞方式配置（按优先级排序）
     transports: []TransportConfig = &.{},
@@ -273,6 +292,16 @@ pub const ConfigManager = struct {
         try writer.writeAll("  \"// 日志设置\": \"\",\n");
         try writer.print("  \"log_level\": \"{s}\",\n", .{self.config.log_level});
         try writer.print("  \"log_color\": {s},\n", .{if (self.config.log_color) "true" else "false"});
+        try writer.writeAll("\n");
+        try writer.writeAll("  \"// TLS 加密设置 (公网部署建议启用)\": \"\",\n");
+        try writer.writeAll("  \"tls\": {\n");
+        try writer.print("    \"enabled\": {s},\n", .{if (self.config.tls.enabled) "true" else "false"});
+        try writer.print("    \"verify_server\": {s},\n", .{if (self.config.tls.verify_server) "true" else "false"});
+        try writer.print("    \"allow_self_signed\": {s},\n", .{if (self.config.tls.allow_self_signed) "true" else "false"});
+        try writer.print("    \"ca_cert_file\": \"{s}\",\n", .{self.config.tls.ca_cert_file});
+        try writer.print("    \"client_cert_file\": \"{s}\",\n", .{self.config.tls.client_cert_file});
+        try writer.print("    \"client_key_file\": \"{s}\"\n", .{self.config.tls.client_key_file});
+        try writer.writeAll("  },\n");
         try writer.writeAll("\n");
         try writer.writeAll("  \"// 打洞方式配置 (按优先级排序，数字越小越优先)\": \"\",\n");
         try writer.writeAll("  \"transports\": [\n");

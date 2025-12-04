@@ -10,6 +10,7 @@ const log = @import("log.zig");
 const net_utils = @import("net_utils.zig");
 const protocol = @import("protocol.zig");
 const stun = @import("stun.zig");
+const tls = @import("tls.zig");
 
 /// 客户端信息
 pub const ClientInfo = struct {
@@ -23,8 +24,12 @@ pub const ClientInfo = struct {
     local_addr: net.Address,
     /// 公网地址
     public_addr: ?net.Address = null,
-    /// socket
+    /// socket (非 TLS 模式)
     socket: posix.socket_t,
+    /// TLS 连接 (TLS 模式)
+    tls_conn: ?*tls.TlsConnection = null,
+    /// 是否使用 TLS
+    use_tls: bool = false,
     /// 连接时间
     connected_at: i64,
     /// 最后活动时间
@@ -72,6 +77,12 @@ pub const ServerConfig = struct {
     heartbeat_interval: u32 = 30,
     /// 客户端超时 (秒)
     client_timeout: u32 = 120,
+    /// 是否启用 TLS
+    tls_enabled: bool = true,
+    /// 证书文件路径
+    cert_file: []const u8 = "server.crt",
+    /// 私钥文件路径
+    key_file: []const u8 = "server.key",
 };
 
 /// 打洞服务器
@@ -121,6 +132,12 @@ pub const PunchServer = struct {
         log.info("========================================", .{});
         log.info("  打洞信令服务器启动中...", .{});
         log.info("========================================", .{});
+
+        if (self.config.tls_enabled) {
+            log.info("  TLS 加密: 已启用", .{});
+        } else {
+            log.warn("  TLS 加密: 已禁用 (不建议在公网使用)", .{});
+        }
 
         // 解析监听地址
         const listen_addr = try net.Address.parseIp4(self.config.listen_addr, self.config.listen_port);
@@ -209,11 +226,34 @@ pub const PunchServer = struct {
     fn handleClient(self: *Self, sock: posix.socket_t, client_ep: net.Address) !void {
         self.stats.total_connections += 1;
 
+        // 如果启用 TLS，先进行握手
+        var tls_conn: ?tls.TlsConnection = null;
+        if (self.config.tls_enabled) {
+            var conn = tls.TlsConnection.initServer(sock, .{
+                .enabled = true,
+                .cert_file = self.config.cert_file,
+                .key_file = self.config.key_file,
+            });
+            conn.handshake() catch |e| {
+                log.err("TLS 握手失败: {any}", .{e});
+                return;
+            };
+            tls_conn = conn;
+            log.info("TLS 握手成功", .{});
+        }
+
         // 接收注册消息
         var buf: [4096]u8 = undefined;
-        const recv_len = posix.recv(sock, &buf, 0) catch |e| {
-            log.err("接收注册消息失败: {any}", .{e});
-            return;
+        const recv_len = if (tls_conn) |*tc| blk: {
+            break :blk tc.recv(&buf) catch |e| {
+                log.err("TLS 接收注册消息失败: {any}", .{e});
+                return;
+            };
+        } else blk: {
+            break :blk posix.recv(sock, &buf, 0) catch |e| {
+                log.err("接收注册消息失败: {any}", .{e});
+                return;
+            };
         };
 
         if (recv_len < protocol.MessageHeader.SIZE) {
@@ -594,6 +634,9 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var config = ServerConfig{};
+    var cmd_tls_enabled: ?bool = null;
+    var cmd_cert_file: ?[]const u8 = null;
+    var cmd_key_file: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -603,11 +646,30 @@ pub fn main() !void {
                 config.listen_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 7891;
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--tls")) {
+            cmd_tls_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--no-tls")) {
+            cmd_tls_enabled = false;
+        } else if (std.mem.eql(u8, arg, "--cert")) {
+            if (i + 1 < args.len) {
+                cmd_cert_file = args[i + 1];
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            if (i + 1 < args.len) {
+                cmd_key_file = args[i + 1];
+                i += 1;
+            }
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
         }
     }
+
+    // 应用命令行参数
+    if (cmd_tls_enabled) |v| config.tls_enabled = v;
+    if (cmd_cert_file) |v| config.cert_file = v;
+    if (cmd_key_file) |v| config.key_file = v;
 
     var server = PunchServer.init(allocator, config);
     defer server.deinit();
@@ -622,8 +684,32 @@ fn printUsage() void {
         \\用法: punch_server [选项]
         \\
         \\选项:
-        \\  -p, --port <端口>    监听端口 (默认: 7891)
-        \\  -h, --help          显示帮助信息
+        \\  -p, --port <端口>     监听端口 (默认: 7891)
+        \\
+        \\TLS 选项:
+        \\  --tls                 强制启用 TLS 加密 (默认已启用)
+        \\  --no-tls              禁用 TLS 加密 (仅用于本地调试)
+        \\  --cert <路径>         TLS 证书文件路径 (默认: server.crt)
+        \\  --key <路径>          TLS 私钥文件路径 (默认: server.key)
+        \\
+        \\  -h, --help            显示帮助信息
+        \\
+        \\说明:
+        \\  首次启动时，如果证书文件不存在，会自动生成自签名证书。
+        \\  自签名证书仅用于测试，生产环境请使用正式的 TLS 证书。
+        \\
+        \\示例:
+        \\  # 默认启动 (TLS 启用，自动生成证书)
+        \\  punch_server
+        \\
+        \\  # 指定端口
+        \\  punch_server -p 8891
+        \\
+        \\  # 使用指定证书
+        \\  punch_server --cert /path/to/cert.pem --key /path/to/key.pem
+        \\
+        \\  # 本地调试禁用 TLS
+        \\  punch_server --no-tls
         \\
     ;
     std.debug.print("{s}", .{usage});
