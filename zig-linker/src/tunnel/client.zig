@@ -11,6 +11,7 @@ const net_utils = @import("net_utils.zig");
 const protocol = @import("protocol.zig");
 const stun = @import("stun.zig");
 const transport_mod = @import("transport.zig");
+const config_mod = @import("config.zig");
 
 /// 客户端配置
 pub const ClientConfig = struct {
@@ -704,6 +705,162 @@ pub const PunchClient = struct {
     pub fn isConnected(self: *const Self) bool {
         return self.server_socket != null and self.registered;
     }
+
+    /// 自动打洞 - 按配置文件中的优先级顺序尝试所有打洞方式
+    pub fn autoPunch(self: *Self, target_id: []const u8, transports: []const config_mod.TransportConfig) !AutoPunchResult {
+        var result = AutoPunchResult{
+            .success = false,
+            .tried_methods = 0,
+            .successful_method = null,
+            .connection = null,
+            .total_duration_ms = 0,
+            .results = undefined,
+        };
+
+        const start_time = std.time.milliTimestamp();
+
+        log.info("", .{});
+        log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+        log.info("║              开始自动打洞                                    ║", .{});
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 目标节点: {s}", .{target_id});
+        log.info("║ 待尝试方式数: {d}", .{transports.len});
+        log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+        log.info("", .{});
+
+        var method_idx: usize = 0;
+        for (transports) |transport_config| {
+            if (!transport_config.enabled) {
+                log.debug("跳过已禁用的打洞方式: {s}", .{transport_config.name});
+                continue;
+            }
+
+            const transport_type = config_mod.ClientConfiguration.getTransportType(transport_config.name) orelse {
+                log.warn("未知的打洞方式: {s}", .{transport_config.name});
+                continue;
+            };
+
+            if (method_idx >= result.results.len) break;
+
+            result.tried_methods += 1;
+            const method_start = std.time.milliTimestamp();
+
+            log.info("", .{});
+            log.info("┌──────────────────────────────────────────────────────────────┐", .{});
+            log.info("│ [{d}/{d}] 尝试打洞方式: {s}", .{ result.tried_methods, transports.len, transport_config.name });
+            log.info("│ 优先级: {d}, 超时: {d}s, 重试: {d}次", .{
+                transport_config.priority,
+                transport_config.timeout_seconds,
+                transport_config.retry_count,
+            });
+            log.info("└──────────────────────────────────────────────────────────────┘", .{});
+
+            // 尝试打洞（带重试）
+            var retry: u8 = 0;
+            var punch_result: PunchResult = undefined;
+            while (retry <= transport_config.retry_count) : (retry += 1) {
+                if (retry > 0) {
+                    log.info("  重试第 {d}/{d} 次...", .{ retry, transport_config.retry_count });
+                }
+
+                punch_result = self.requestPunch(target_id, transport_type) catch |e| {
+                    log.err("  打洞请求异常: {any}", .{e});
+                    punch_result = PunchResult{
+                        .success = false,
+                        .error_message = "请求异常",
+                        .duration_ms = 0,
+                    };
+                    continue;
+                };
+
+                if (punch_result.success) {
+                    break;
+                }
+
+                // 短暂等待后重试
+                if (retry < transport_config.retry_count) {
+                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                }
+            }
+
+            const method_duration = @as(u64, @intCast(std.time.milliTimestamp() - method_start));
+
+            // 记录结果
+            result.results[method_idx] = .{
+                .transport_name = transport_config.name,
+                .success = punch_result.success,
+                .duration_ms = method_duration,
+                .error_message = punch_result.error_message,
+            };
+            method_idx += 1;
+
+            if (punch_result.success) {
+                log.info("", .{});
+                log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+                log.info("║  ✓ 打洞成功!                                                 ║", .{});
+                log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+                log.info("║ 使用方式: {s}", .{transport_config.name});
+                log.info("║ 耗时: {d} ms", .{method_duration});
+                log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+
+                result.success = true;
+                result.successful_method = transport_type;
+                result.connection = punch_result.connection;
+                break;
+            } else {
+                log.warn("  ✗ 打洞失败: {s} (耗时: {d}ms)", .{ punch_result.error_message, method_duration });
+            }
+        }
+
+        result.total_duration_ms = @intCast(std.time.milliTimestamp() - start_time);
+
+        // 打印最终结果摘要
+        log.info("", .{});
+        log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+        if (result.success) {
+            log.info("║              自动打洞完成 - 成功                              ║", .{});
+        } else {
+            log.info("║              自动打洞完成 - 失败                              ║", .{});
+        }
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 尝试方式数: {d}", .{result.tried_methods});
+        log.info("║ 总耗时: {d} ms", .{result.total_duration_ms});
+        if (result.successful_method) |method| {
+            log.info("║ 成功方式: {s}", .{method.name()});
+        }
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 详细结果:", .{});
+        for (result.results[0..method_idx]) |r| {
+            const status = if (r.success) "✓" else "✗";
+            log.info("║   {s} {s}: {d}ms {s}", .{ status, r.transport_name, r.duration_ms, r.error_message });
+        }
+        log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+
+        return result;
+    }
+};
+
+/// 自动打洞结果
+pub const AutoPunchResult = struct {
+    /// 是否成功
+    success: bool,
+    /// 尝试的方式数量
+    tried_methods: u32,
+    /// 成功的方式
+    successful_method: ?types.TransportType,
+    /// 连接
+    connection: ?transport_mod.ITunnelConnection,
+    /// 总耗时
+    total_duration_ms: u64,
+    /// 每种方式的结果
+    results: [8]MethodResult = undefined,
+
+    pub const MethodResult = struct {
+        transport_name: []const u8 = "",
+        success: bool = false,
+        duration_ms: u64 = 0,
+        error_message: []const u8 = "",
+    };
 };
 
 /// 客户端入口函数
@@ -716,28 +873,37 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var config = ClientConfig{};
+    var config_path: []const u8 = "punch_client.json";
     var target_id: ?[]const u8 = null;
-    var transport_str: []const u8 = "udp";
+    var transport_str: ?[]const u8 = null;
     var list_only = false;
+    var auto_mode = false;
+    var cmd_server_addr: ?[]const u8 = null;
+    var cmd_server_port: ?u16 = null;
+    var cmd_machine_name: ?[]const u8 = null;
 
     // 简单参数解析
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--server")) {
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
             if (i + 1 < args.len) {
-                config.server_addr = args[i + 1];
+                config_path = args[i + 1];
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--server")) {
+            if (i + 1 < args.len) {
+                cmd_server_addr = args[i + 1];
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
-                config.server_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 7891;
+                cmd_server_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 7891;
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--name")) {
             if (i + 1 < args.len) {
-                config.machine_name = args[i + 1];
+                cmd_machine_name = args[i + 1];
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--target")) {
@@ -750,6 +916,8 @@ pub fn main() !void {
                 transport_str = args[i + 1];
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--auto")) {
+            auto_mode = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
             list_only = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -758,10 +926,38 @@ pub fn main() !void {
         }
     }
 
-    // 解析传输方式
-    const transport_type = parseTransportType(transport_str);
+    // 加载配置文件
+    var config_manager = config_mod.ConfigManager.init(allocator, config_path);
+    defer config_manager.deinit();
 
-    var client = PunchClient.init(allocator, config);
+    config_manager.load() catch |e| {
+        log.err("加载配置文件失败: {any}", .{e});
+        log.info("将使用默认配置", .{});
+    };
+
+    // 应用日志配置
+    config_manager.applyLogConfig();
+
+    // 命令行参数覆盖配置文件
+    const client_config = ClientConfig{
+        .server_addr = cmd_server_addr orelse config_manager.config.server_addr,
+        .server_port = cmd_server_port orelse config_manager.config.server_port,
+        .machine_name = cmd_machine_name orelse config_manager.config.machine_name,
+        .machine_id = config_manager.config.machine_id,
+        .heartbeat_interval = config_manager.config.heartbeat_interval,
+        .port_map_wan = config_manager.config.port_map_wan,
+        .stun_server = config_manager.config.stun_server,
+        .stun_port = config_manager.config.stun_port,
+        .auto_detect_nat = config_manager.config.auto_detect_nat,
+    };
+
+    log.info("", .{});
+    log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+    log.info("║              打洞客户端启动                                  ║", .{});
+    log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+    log.info("", .{});
+
+    var client = PunchClient.init(allocator, client_config);
     defer client.deinit();
 
     try client.connect();
@@ -777,36 +973,80 @@ pub fn main() !void {
             peers.deinit(allocator);
         }
 
-        log.info("在线节点列表:", .{});
-        log.info("========================================", .{});
-        for (peers.items, 0..) |peer, idx| {
-            log.info("  {d}. ID: {s}", .{ idx + 1, peer.machine_id });
-            log.info("     名称: {s}", .{peer.machine_name});
-            log.info("     NAT: {s}", .{peer.nat_type.description()});
-        }
+        log.info("", .{});
+        log.info("┌────────────────────────────────────────────────────────────────┐", .{});
+        log.info("│                    在线节点列表                                │", .{});
+        log.info("├────┬──────────────────┬──────────────────┬─────────────────────┤", .{});
+        log.info("│ #  │ ID               │ 名称             │ NAT类型             │", .{});
+        log.info("├────┼──────────────────┼──────────────────┼─────────────────────┤", .{});
+
         if (peers.items.len == 0) {
-            log.info("  (无其他在线节点)", .{});
+            log.info("│                    (无其他在线节点)                           │", .{});
+        } else {
+            for (peers.items, 0..) |peer, idx| {
+                // 格式化 ID
+                var id_buf: [16]u8 = undefined;
+                @memset(&id_buf, ' ');
+                const id_len = @min(peer.machine_id.len, 16);
+                @memcpy(id_buf[0..id_len], peer.machine_id[0..id_len]);
+
+                // 格式化名称
+                var name_buf: [16]u8 = undefined;
+                @memset(&name_buf, ' ');
+                const name_len = @min(peer.machine_name.len, 16);
+                @memcpy(name_buf[0..name_len], peer.machine_name[0..name_len]);
+
+                log.info("│ {d: >2} │ {s} │ {s} │ {s: <19} │", .{
+                    idx + 1,
+                    id_buf,
+                    name_buf,
+                    peer.nat_type.description(),
+                });
+            }
         }
-        log.info("========================================", .{});
+        log.info("└────┴──────────────────┴──────────────────┴─────────────────────┘", .{});
+        log.info("", .{});
     } else if (target_id) |tid| {
-        // 发起打洞
-        const result = try client.requestPunch(tid, transport_type);
+        if (auto_mode or transport_str == null) {
+            // 自动模式：按配置顺序尝试所有打洞方式
+            log.info("使用自动模式，将按配置顺序尝试所有打洞方式", .{});
 
-        if (result.success) {
-            log.info("打洞成功! 可以开始通信", .{});
+            const result = try client.autoPunch(tid, config_manager.config.transports);
 
-            // 示例：发送测试消息
-            if (result.connection) |*conn| {
-                var connection = conn.*;
-                _ = connection.send("Hello from Zig!") catch {};
-                connection.close();
+            if (result.success) {
+                log.info("自动打洞成功! 可以开始通信", .{});
+
+                if (result.connection) |*conn| {
+                    var connection = conn.*;
+                    _ = connection.send("Hello from Zig Auto Punch!") catch {};
+                    connection.close();
+                }
+            } else {
+                log.err("自动打洞失败，所有方式均未成功", .{});
             }
         } else {
-            log.err("打洞失败: {s}", .{result.error_message});
+            // 指定方式打洞
+            const transport_type = parseTransportType(transport_str.?);
+            log.info("使用指定方式打洞: {s}", .{transport_type.name()});
+
+            const result = try client.requestPunch(tid, transport_type);
+
+            if (result.success) {
+                log.info("打洞成功! 可以开始通信", .{});
+
+                if (result.connection) |*conn| {
+                    var connection = conn.*;
+                    _ = connection.send("Hello from Zig!") catch {};
+                    connection.close();
+                }
+            } else {
+                log.err("打洞失败: {s}", .{result.error_message});
+            }
         }
     } else {
         // 等待其他节点连接
         log.info("等待打洞请求...", .{});
+        log.info("提示: 使用 -t <目标ID> 来发起打洞", .{});
         try client.runLoop();
     }
 }
@@ -824,35 +1064,51 @@ fn parseTransportType(str: []const u8) types.TransportType {
 
 fn printUsage() void {
     const usage =
-        \\打洞客户端
+        \\打洞客户端 (支持配置文件和自动打洞)
         \\
         \\用法: client [选项]
         \\
         \\选项:
-        \\  -s, --server <地址>   服务器地址 (默认: 127.0.0.1)
-        \\  -p, --port <端口>     服务器端口 (默认: 7891)
-        \\  -n, --name <名称>     本机名称
+        \\  -c, --config <路径>   配置文件路径 (默认: punch_client.json)
+        \\  -s, --server <地址>   服务器地址 (覆盖配置文件)
+        \\  -p, --port <端口>     服务器端口 (覆盖配置文件)
+        \\  -n, --name <名称>     本机名称 (覆盖配置文件)
         \\  -t, --target <ID>     目标节点 ID (发起打洞)
-        \\  -m, --method <方式>   传输方式:
-        \\                          udp       - UDP 打洞 (默认)
+        \\  -m, --method <方式>   传输方式 (指定单一方式):
+        \\                          udp       - UDP 打洞
         \\                          udp-p2p   - UDP 同时打开
         \\                          tcp-p2p   - TCP 同时打开
         \\                          tcp-ttl   - TCP 低 TTL
         \\                          udp-map   - UDP 端口映射
         \\                          tcp-map   - TCP 端口映射
         \\                          quic      - MsQuic
+        \\  -a, --auto            自动模式 (按配置顺序尝试所有打洞方式)
         \\  -l, --list            列出在线节点
         \\  -h, --help            显示帮助信息
         \\
+        \\配置文件说明:
+        \\  首次运行时会自动生成默认配置文件 punch_client.json
+        \\  配置文件包含服务器设置、NAT 设置和打洞方式优先级
+        \\  可编辑配置文件调整打洞方式的启用状态和优先级
+        \\
         \\示例:
-        \\  # 连接服务器并等待连接
-        \\  client -s 192.168.1.100 -n "我的电脑"
+        \\  # 使用默认配置连接服务器并等待连接
+        \\  client
+        \\
+        \\  # 使用指定配置文件
+        \\  client -c /path/to/config.json
         \\
         \\  # 列出在线节点
-        \\  client -s 192.168.1.100 -l
+        \\  client -l
         \\
-        \\  # 向指定节点发起 UDP 打洞
-        \\  client -s 192.168.1.100 -t node123 -m udp
+        \\  # 自动模式向指定节点打洞 (按配置优先级尝试)
+        \\  client -t node123 -a
+        \\
+        \\  # 向指定节点发起指定方式打洞
+        \\  client -t node123 -m udp
+        \\
+        \\  # 命令行参数覆盖配置文件
+        \\  client -s 192.168.1.100 -p 7891 -n "我的电脑"
         \\
     ;
     std.debug.print("{s}", .{usage});

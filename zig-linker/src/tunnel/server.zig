@@ -33,6 +33,31 @@ pub const ClientInfo = struct {
     port_map_wan: u16 = 0,
     /// 路由级别
     route_level: u8 = 8,
+
+    /// 格式化地址为字符串
+    pub fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+
+        switch (addr.any.family) {
+            posix.AF.INET => {
+                const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
+                writer.print("{d}.{d}.{d}.{d}:{d}", .{
+                    bytes[0],                                  bytes[1], bytes[2], bytes[3],
+                    std.mem.bigToNative(u16, addr.in.sa.port),
+                }) catch return "(error)";
+            },
+            posix.AF.INET6 => {
+                writer.print("[IPv6]:{d}", .{
+                    std.mem.bigToNative(u16, addr.in6.sa.port),
+                }) catch return "(error)";
+            },
+            else => {
+                return "(unknown)";
+            },
+        }
+        return fbs.getWritten();
+    }
 };
 
 /// 打洞服务器配置
@@ -231,16 +256,33 @@ pub const PunchServer = struct {
         // 存储客户端信息
         try self.clients.put(client_info.machine_id, client_info);
 
-        log.info("========================================", .{});
-        log.info("  客户端注册成功", .{});
-        log.info("  ID: {s}", .{client_info.machine_id});
-        log.info("  名称: {s}", .{client_info.machine_name});
-        log.info("  NAT 类型: {s}", .{client_info.nat_type.description()});
-        log.info("  本地地址: {any}", .{client_info.local_addr});
-        log.info("  公网地址: {any}", .{client_ep});
-        log.info("  端口映射: {d}", .{client_info.port_map_wan});
-        log.info("  当前在线客户端数: {d}", .{self.clients.count()});
-        log.info("========================================", .{});
+        log.info("", .{});
+        log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+        log.info("║              客户端注册成功                                  ║", .{});
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ ID:       {s}", .{client_info.machine_id});
+        log.info("║ 名称:     {s}", .{client_info.machine_name});
+        log.info("║ NAT类型:  {s}", .{client_info.nat_type.description()});
+
+        var local_buf: [64]u8 = undefined;
+        log.info("║ 本地地址: {s}", .{ClientInfo.formatAddress(client_info.local_addr, &local_buf)});
+
+        if (client_info.public_addr) |pub_addr| {
+            var pub_buf: [64]u8 = undefined;
+            log.info("║ 公网地址: {s}", .{ClientInfo.formatAddress(pub_addr, &pub_buf)});
+        }
+
+        if (client_info.port_map_wan != 0) {
+            log.info("║ 端口映射: {d}", .{client_info.port_map_wan});
+        }
+        log.info("║ 路由层级: {d}", .{client_info.route_level});
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 当前在线客户端数: {d}", .{self.clients.count()});
+        log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+        log.info("", .{});
+
+        // 打印所有在线客户端列表
+        self.printOnlineClients();
 
         // 发送注册成功响应
         try self.sendRegisterResponse(sock, true, client_info.machine_id);
@@ -473,6 +515,71 @@ pub const PunchServer = struct {
     /// 获取在线客户端数量
     pub fn getClientCount(self: *const Self) usize {
         return self.clients.count();
+    }
+
+    /// 打印所有在线客户端列表（便于手动连接）
+    pub fn printOnlineClients(self: *Self) void {
+        const count = self.clients.count();
+        if (count == 0) {
+            log.info("当前无在线客户端", .{});
+            return;
+        }
+
+        log.info("", .{});
+        log.info("┌────────────────────────────────────────────────────────────────────────────────┐", .{});
+        log.info("│                           在线客户端列表 ({d} 个)                               │", .{count});
+        log.info("├────┬──────────────────┬──────────────────┬──────────────┬─────────────────────┤", .{});
+        log.info("│ #  │ ID               │ 名称             │ NAT类型      │ 公网地址            │", .{});
+        log.info("├────┼──────────────────┼──────────────────┼──────────────┼─────────────────────┤", .{});
+
+        var iter = self.clients.iterator();
+        var idx: u32 = 1;
+        while (iter.next()) |entry| {
+            const client = entry.value_ptr;
+
+            // 格式化 ID（截断或填充到 16 字符）
+            var id_buf: [16]u8 = undefined;
+            @memset(&id_buf, ' ');
+            const id_len = @min(client.machine_id.len, 16);
+            @memcpy(id_buf[0..id_len], client.machine_id[0..id_len]);
+
+            // 格式化名称（截断或填充到 16 字符）
+            var name_buf: [16]u8 = undefined;
+            @memset(&name_buf, ' ');
+            const name_len = @min(client.machine_name.len, 16);
+            @memcpy(name_buf[0..name_len], client.machine_name[0..name_len]);
+
+            // 格式化 NAT 类型（截断或填充到 12 字符）
+            const nat_desc = client.nat_type.description();
+            var nat_buf: [12]u8 = undefined;
+            @memset(&nat_buf, ' ');
+            const nat_len = @min(nat_desc.len, 12);
+            @memcpy(nat_buf[0..nat_len], nat_desc[0..nat_len]);
+
+            // 格式化公网地址
+            var addr_buf: [64]u8 = undefined;
+            var addr_str: []const u8 = "(无)";
+            if (client.public_addr) |pub_addr| {
+                addr_str = ClientInfo.formatAddress(pub_addr, &addr_buf);
+            }
+
+            log.info("│ {d: >2} │ {s} │ {s} │ {s} │ {s: <19} │", .{
+                idx,
+                id_buf,
+                name_buf,
+                nat_buf,
+                addr_str,
+            });
+
+            idx += 1;
+        }
+
+        log.info("└────┴──────────────────┴──────────────────┴──────────────┴─────────────────────┘", .{});
+        log.info("", .{});
+        log.info("提示: 客户端可使用以下命令连接指定节点:", .{});
+        log.info("  punch_client -s <服务器地址> -t <目标ID> -m <打洞方式>", .{});
+        log.info("  打洞方式: udp, udp-p2p, tcp-p2p, tcp-ttl, udp-map, tcp-map, quic", .{});
+        log.info("", .{});
     }
 };
 
