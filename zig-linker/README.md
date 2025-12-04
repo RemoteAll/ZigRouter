@@ -9,11 +9,21 @@
 | 方式 | 状态 | 说明 |
 |------|------|------|
 | UDP 打洞 | ✅ 已实现 | 最基础的 UDP 打洞方式 |
+| UDP 同时打开 (UdpP2PNAT) | ✅ 已实现 | UDP Simultaneous Open |
 | TCP 同时打开 (TcpP2PNAT) | ✅ 已实现 | TCP Simultaneous Open |
 | TCP 低 TTL (TcpNutssb) | ✅ 已实现 | 利用低 TTL 值穿透 NAT |
 | UDP 端口映射 | ✅ 已实现 | 需要配置固定端口映射 |
 | TCP 端口映射 | ✅ 已实现 | 需要配置固定端口映射 |
 | MsQuic | ❌ 未实现 | 见下方说明 |
+
+### 辅助功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| UPnP IGD | ✅ 已实现 | 自动端口映射（SSDP + SOAP） |
+| NAT-PMP | ✅ 已实现 | Apple 轻量级端口映射协议 |
+| XML 解析器 | ✅ 已实现 | 解析 UPnP SOAP 响应 |
+| STUN | ✅ 已实现 | NAT 类型检测 |
 
 ### MsQuic 未实现说明
 
@@ -49,7 +59,8 @@ src/
     ├── net_utils.zig # 网络工具（Socket 操作、端口复用等）
     ├── stun.zig      # STUN 协议实现（NAT 类型检测）
     ├── protocol.zig  # 通信协议定义
-    ├── transport.zig # 6 种打洞传输方式实现
+    ├── transport.zig # 7 种打洞传输方式实现
+    ├── upnp.zig      # UPnP IGD 和 NAT-PMP 自动端口映射
     ├── server.zig    # 打洞信令服务器
     └── client.zig    # 打洞客户端
 ```
@@ -90,6 +101,9 @@ punch_client -s 服务器IP -l
 ```bash
 # UDP 打洞（默认）
 punch_client -s 服务器IP -t 目标节点ID -m udp
+
+# UDP 同时打开
+punch_client -s 服务器IP -t 目标节点ID -m udp-p2p
 
 # TCP 同时打开
 punch_client -s 服务器IP -t 目标节点ID -m tcp-p2p
