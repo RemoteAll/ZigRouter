@@ -130,7 +130,7 @@ punch_client -s 服务器IP -t 目标节点ID -m tcp-map
 ## TODO
 
 - [ ] 实现 MsQuic 传输方式
-- [ ] 添加 UPnP/NAT-PMP 自动端口映射
+- [x] 添加 UPnP/NAT-PMP 自动端口映射
 - [ ] 支持 IPv6
 - [ ] 添加中继服务器（Relay）支持
 - [ ] 性能优化和压力测试

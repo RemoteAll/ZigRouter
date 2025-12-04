@@ -813,6 +813,7 @@ pub fn main() !void {
 
 fn parseTransportType(str: []const u8) types.TransportType {
     if (std.mem.eql(u8, str, "udp")) return .udp;
+    if (std.mem.eql(u8, str, "udp_p2p_nat") or std.mem.eql(u8, str, "udp-p2p")) return .udp_p2p_nat;
     if (std.mem.eql(u8, str, "tcp_p2p_nat") or std.mem.eql(u8, str, "tcp-p2p")) return .tcp_p2p_nat;
     if (std.mem.eql(u8, str, "tcp_nutssb") or std.mem.eql(u8, str, "tcp-ttl")) return .tcp_nutssb;
     if (std.mem.eql(u8, str, "udp_port_map") or std.mem.eql(u8, str, "udp-map")) return .udp_port_map;
@@ -834,6 +835,7 @@ fn printUsage() void {
         \\  -t, --target <ID>     目标节点 ID (发起打洞)
         \\  -m, --method <方式>   传输方式:
         \\                          udp       - UDP 打洞 (默认)
+        \\                          udp-p2p   - UDP 同时打开
         \\                          tcp-p2p   - TCP 同时打开
         \\                          tcp-ttl   - TCP 低 TTL
         \\                          udp-map   - UDP 端口映射
@@ -873,6 +875,7 @@ test "PunchClient init and deinit" {
 
 test "parseTransportType" {
     try std.testing.expectEqual(types.TransportType.udp, parseTransportType("udp"));
+    try std.testing.expectEqual(types.TransportType.udp_p2p_nat, parseTransportType("udp-p2p"));
     try std.testing.expectEqual(types.TransportType.tcp_p2p_nat, parseTransportType("tcp-p2p"));
     try std.testing.expectEqual(types.TransportType.tcp_nutssb, parseTransportType("tcp-ttl"));
     try std.testing.expectEqual(types.TransportType.udp, parseTransportType("unknown"));

@@ -129,7 +129,7 @@ pub const TransportUdp = struct {
     const Self = @This();
 
     /// 传输方式名称
-    pub const NAME = "UDP";
+    pub const NAME = "Udp";
     /// 传输方式标签
     pub const LABEL = "UDP、非常纯";
     /// 协议类型
@@ -339,6 +339,152 @@ pub const TransportUdp = struct {
             // 我要去连对方
             return try self.connectForward(info);
         }
+    }
+};
+
+/// ============================================================
+/// UDP 同时打开 (UDP Simultaneous Open) 打洞传输
+/// 大致原理：
+/// A 通知 B，B 立马发送 UDP 给 A，A 也同时发送 UDP 给 B
+/// 双方同时发送，利用 NAT 的特性使数据包能够穿透
+/// 比普通 UDP 打洞更简单直接，双方都主动发送
+/// ============================================================
+pub const TransportUdpP2PNAT = struct {
+    const Self = @This();
+
+    pub const NAME = "UdpP2PNAT";
+    pub const LABEL = "UDP、同时打开";
+    pub const PROTOCOL_TYPE = types.TunnelProtocolType.udp;
+    pub const ORDER: u8 = 3;
+
+    config: Config,
+    callbacks: TransportCallbacks,
+
+    pub const Config = struct {
+        /// 连接超时 (毫秒)
+        connect_timeout_ms: u32 = 500,
+        /// 重试次数
+        retry_count: u32 = 5,
+        /// 是否启用 SSL
+        ssl: bool = false,
+    };
+
+    pub fn init(cfg: Config, callbacks: TransportCallbacks) Self {
+        return Self{
+            .config = cfg,
+            .callbacks = callbacks,
+        };
+    }
+
+    /// 连接对方 - 双方同时发起连接
+    pub fn connectAsync(self: *Self, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
+        log.logPunchStart(.udp_p2p_nat, info.direction, info.local, info.remote);
+
+        // UDP 同时打开模式：无论正向反向，双方都执行相同的连接逻辑
+        const mode: types.TunnelMode = if (info.direction == .forward) .client else .server;
+        return try self.connectForward(info, mode);
+    }
+
+    /// 收到打洞开始通知时的处理 - 立即开始双向发送
+    pub fn onBegin(self: *Self, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
+        // 收到对方通知后，立即开始连接
+        const mode: types.TunnelMode = if (info.direction == .forward) .server else .client;
+        return try self.connectForward(info, mode);
+    }
+
+    /// 执行同时打开连接
+    /// 双方同时向对方发送 UDP 包，利用 NAT 的映射特性完成穿透
+    fn connectForward(self: *Self, info: *const types.TunnelTransportInfo, mode: types.TunnelMode) !?ITunnelConnection {
+        log.debug("UDP P2PNAT 连接开始, 模式: {s}", .{mode.toString()});
+
+        if (info.remote_endpoints.len == 0) {
+            log.logPunchFailed(.udp_p2p_nat, "没有可用的远程端点");
+            return null;
+        }
+
+        // 创建 UDP socket 并绑定到本地端口
+        const sock = try net_utils.createReuseUdpSocket(info.local.local);
+        errdefer posix.close(sock);
+
+        // 设置接收超时
+        try net_utils.setRecvTimeout(sock, self.config.connect_timeout_ms);
+
+        // 等待 500ms 让双方都准备好
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+
+        var recv_buf: [1024]u8 = undefined;
+        var from_addr: posix.sockaddr = undefined;
+        var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+
+        // 重试多次
+        var retry: u32 = 0;
+        while (retry < self.config.retry_count) : (retry += 1) {
+            log.debug("UDP P2PNAT 尝试 {d}/{d}", .{ retry + 1, self.config.retry_count });
+
+            // 向所有远程端点发送认证消息
+            for (info.remote_endpoints) |ep| {
+                log.logConnectAttempt(ep, retry + 1);
+                _ = posix.sendto(sock, UDP_AUTH_BYTES, 0, &ep.any, ep.getOsSockLen()) catch |e| {
+                    log.debug("发送到 {any} 失败: {any}", .{ ep, e });
+                    continue;
+                };
+            }
+
+            // 尝试接收对方的响应
+            const recv_result = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len);
+
+            if (recv_result) |recv_len| {
+                if (recv_len > 0) {
+                    const remote_ep = net.Address{ .any = from_addr };
+
+                    log.debug("收到来自 {any} 的响应, 长度: {d}", .{ remote_ep, recv_len });
+
+                    // 收到响应后，再发送一个确认包
+                    _ = posix.sendto(sock, UDP_AUTH_BYTES, 0, &from_addr, from_len) catch {};
+
+                    // 清空可能的后续包
+                    while (true) {
+                        net_utils.setRecvTimeout(sock, 100) catch break;
+                        _ = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len) catch break;
+                    }
+
+                    // 恢复正常超时
+                    net_utils.setRecvTimeout(sock, self.config.connect_timeout_ms) catch {};
+
+                    const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
+
+                    log.info("UDP P2PNAT 打洞成功! 远程端点: {any}", .{remote_ep_converted});
+
+                    const connection = ITunnelConnection{
+                        .info = types.TunnelConnectionInfo{
+                            .remote_endpoint = remote_ep_converted,
+                            .remote_machine_id = info.remote.machine_id,
+                            .remote_machine_name = info.remote.machine_name,
+                            .transport_name = .udp_p2p_nat,
+                            .direction = info.direction,
+                            .protocol_type = .udp,
+                            .tunnel_type = .p2p,
+                            .mode = mode,
+                            .ssl = info.ssl,
+                            .connected_at = std.time.timestamp(),
+                        },
+                        .socket = sock,
+                        .connected = true,
+                    };
+
+                    log.logPunchSuccess(.udp_p2p_nat, connection.info);
+                    return connection;
+                }
+            } else |e| {
+                if (e != error.WouldBlock) {
+                    log.debug("接收失败: {any}", .{e});
+                }
+            }
+        }
+
+        log.logPunchFailed(.udp_p2p_nat, "所有连接尝试均失败");
+        posix.close(sock);
+        return null;
     }
 };
 
@@ -1086,6 +1232,7 @@ pub const TransportManager = struct {
 
     // 各种传输方式
     udp: TransportUdp,
+    udp_p2p_nat: TransportUdpP2PNAT,
     tcp_p2p_nat: TransportTcpP2PNAT,
     tcp_nutssb: TransportTcpNutssb,
     udp_port_map: TransportUdpPortMap,
@@ -1097,6 +1244,7 @@ pub const TransportManager = struct {
             .allocator = allocator,
             .callbacks = callbacks,
             .udp = TransportUdp.init(.{}, callbacks),
+            .udp_p2p_nat = TransportUdpP2PNAT.init(.{}, callbacks),
             .tcp_p2p_nat = TransportTcpP2PNAT.init(.{}, callbacks),
             .tcp_nutssb = TransportTcpNutssb.init(.{}, callbacks),
             .udp_port_map = TransportUdpPortMap.init(.{}, callbacks),
@@ -1113,6 +1261,7 @@ pub const TransportManager = struct {
     /// 根据传输方式名称获取对应的传输器
     pub fn getTransport(self: *Self, transport_type: types.TransportType) union(enum) {
         udp: *TransportUdp,
+        udp_p2p_nat: *TransportUdpP2PNAT,
         tcp_p2p_nat: *TransportTcpP2PNAT,
         tcp_nutssb: *TransportTcpNutssb,
         udp_port_map: *TransportUdpPortMap,
@@ -1121,6 +1270,7 @@ pub const TransportManager = struct {
     } {
         return switch (transport_type) {
             .udp => .{ .udp = &self.udp },
+            .udp_p2p_nat => .{ .udp_p2p_nat = &self.udp_p2p_nat },
             .tcp_p2p_nat => .{ .tcp_p2p_nat = &self.tcp_p2p_nat },
             .tcp_nutssb => .{ .tcp_nutssb = &self.tcp_nutssb },
             .udp_port_map => .{ .udp_port_map = &self.udp_port_map },
@@ -1133,6 +1283,7 @@ pub const TransportManager = struct {
     pub fn connect(self: *Self, transport_type: types.TransportType, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
         return switch (transport_type) {
             .udp => try self.udp.connectAsync(info),
+            .udp_p2p_nat => try self.udp_p2p_nat.connectAsync(info),
             .tcp_p2p_nat => try self.tcp_p2p_nat.connectAsync(info),
             .tcp_nutssb => try self.tcp_nutssb.connectAsync(info),
             .udp_port_map => try self.udp_port_map.connectAsync(info),
@@ -1143,8 +1294,14 @@ pub const TransportManager = struct {
 };
 
 test "TransportUdp name and label" {
-    try std.testing.expectEqualStrings("UDP", TransportUdp.NAME);
+    try std.testing.expectEqualStrings("Udp", TransportUdp.NAME);
     try std.testing.expectEqualStrings("UDP、非常纯", TransportUdp.LABEL);
+}
+
+test "TransportUdpP2PNAT name and label" {
+    try std.testing.expectEqualStrings("UdpP2PNAT", TransportUdpP2PNAT.NAME);
+    try std.testing.expectEqualStrings("UDP、同时打开", TransportUdpP2PNAT.LABEL);
+    try std.testing.expectEqual(types.TunnelProtocolType.udp, TransportUdpP2PNAT.PROTOCOL_TYPE);
 }
 
 test "TransportManager init" {
@@ -1154,6 +1311,7 @@ test "TransportManager init" {
 
     // 验证可以获取各种传输器
     _ = manager.getTransport(.udp);
+    _ = manager.getTransport(.udp_p2p_nat);
     _ = manager.getTransport(.tcp_p2p_nat);
     _ = manager.getTransport(.tcp_nutssb);
 }

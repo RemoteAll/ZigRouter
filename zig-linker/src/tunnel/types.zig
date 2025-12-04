@@ -85,6 +85,8 @@ pub const TunnelProtocolType = enum {
 pub const TransportType = enum {
     /// UDP 直接打洞
     udp,
+    /// UDP 同时打开 (UDP Simultaneous Open)
+    udp_p2p_nat,
     /// TCP 同时打开 (TCP Simultaneous Open)
     tcp_p2p_nat,
     /// TCP 低 TTL 打洞
@@ -98,7 +100,8 @@ pub const TransportType = enum {
 
     pub fn name(self: TransportType) []const u8 {
         return switch (self) {
-            .udp => "UDP",
+            .udp => "Udp",
+            .udp_p2p_nat => "UdpP2PNAT",
             .tcp_p2p_nat => "TcpP2PNAT",
             .tcp_nutssb => "TcpNutssb",
             .udp_port_map => "UdpPortMap",
@@ -110,6 +113,7 @@ pub const TransportType = enum {
     pub fn label(self: TransportType) []const u8 {
         return switch (self) {
             .udp => "UDP、非常纯",
+            .udp_p2p_nat => "UDP、同时打开",
             .tcp_p2p_nat => "TCP、同时打开",
             .tcp_nutssb => "TCP、低TTL",
             .udp_port_map => "UDP、端口映射",
@@ -125,7 +129,7 @@ pub const TransportType = enum {
 
     pub fn protocolType(self: TransportType) TunnelProtocolType {
         return switch (self) {
-            .udp, .udp_port_map => .udp,
+            .udp, .udp_p2p_nat, .udp_port_map => .udp,
             .tcp_p2p_nat, .tcp_nutssb, .tcp_port_map => .tcp,
             .msquic => .quic,
         };
@@ -136,6 +140,7 @@ pub const TransportType = enum {
             .udp_port_map => 1,
             .tcp_port_map => 2,
             .udp => 3,
+            .udp_p2p_nat => 3,
             .tcp_p2p_nat => 4,
             .tcp_nutssb => 5,
             .msquic => 255,
