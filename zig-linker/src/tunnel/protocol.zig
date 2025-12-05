@@ -381,6 +381,12 @@ pub const PunchBegin = struct {
     flow_id: u32,
     /// 是否需要 SSL
     ssl: bool,
+    /// 是否在同一局域网
+    same_lan: bool,
+    /// 对方公网地址字符串
+    public_endpoint: []const u8,
+    /// 对方本地地址字符串
+    local_endpoint: []const u8,
     /// 原始数据引用
     _raw_data: []const u8,
 
@@ -422,7 +428,38 @@ pub const PunchBegin = struct {
         offset += 4;
 
         // SSL
-        const ssl = if (offset < data.len) data[offset] != 0 else false;
+        if (offset >= data.len) return null;
+        const ssl = data[offset] != 0;
+        offset += 1;
+
+        // 同局域网标志
+        var same_lan: bool = false;
+        if (offset < data.len) {
+            same_lan = data[offset] != 0;
+            offset += 1;
+        }
+
+        // 公网地址
+        var public_endpoint: []const u8 = "";
+        if (offset + 2 <= data.len) {
+            const pub_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
+            offset += 2;
+            if (offset + pub_len <= data.len) {
+                public_endpoint = data[offset .. offset + pub_len];
+                offset += pub_len;
+            }
+        }
+
+        // 本地地址
+        var local_endpoint: []const u8 = "";
+        if (offset + 2 <= data.len) {
+            const local_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
+            offset += 2;
+            if (offset + local_len <= data.len) {
+                local_endpoint = data[offset .. offset + local_len];
+                offset += local_len;
+            }
+        }
 
         return PunchBegin{
             .source_machine_id = source_id,
@@ -432,14 +469,17 @@ pub const PunchBegin = struct {
             .transaction_id = transaction_id,
             .flow_id = flow_id,
             .ssl = ssl,
+            .same_lan = same_lan,
+            .public_endpoint = public_endpoint,
+            .local_endpoint = local_endpoint,
             ._raw_data = data,
         };
     }
 
     /// 获取解析后的数据大小
     pub fn getSize(self: *const PunchBegin) usize {
-        // 2 (id_len) + id + 1 (nat) + 1 (transport) + 1 (direction) + 16 (txn_id) + 4 (flow_id) + 1 (ssl)
-        return 2 + self.source_machine_id.len + 24;
+        // 2 (id_len) + id + 1 (nat) + 1 (transport) + 1 (direction) + 16 (txn_id) + 4 (flow_id) + 1 (ssl) + 1 (same_lan)
+        return 2 + self.source_machine_id.len + 25;
     }
 };
 

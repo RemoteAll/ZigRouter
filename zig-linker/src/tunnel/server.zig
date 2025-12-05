@@ -576,16 +576,30 @@ pub const PunchServer = struct {
 
         const target_client = target.?;
 
+        // 检测是否在同一局域网（公网地址相同）
+        const same_lan = self.isSameLan(from_client, &target_client);
+        if (same_lan) {
+            var from_addr_buf: [64]u8 = undefined;
+            var target_addr_buf: [64]u8 = undefined;
+            log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+            log.info("║          检测到双方在同一局域网                              ║", .{});
+            log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+            log.info("║ 发起方本地地址: {s}", .{ClientInfo.formatAddress(from_client.local_addr, &from_addr_buf)});
+            log.info("║ 目标方本地地址: {s}", .{ClientInfo.formatAddress(target_client.local_addr, &target_addr_buf)});
+            log.info("║ 将使用内网直连模式，跳过NAT打洞                              ║", .{});
+            log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+        }
+
         // 检查 NAT 类型兼容性
         const can_p2p = from_client.nat_type.canP2P(target_client.nat_type);
-        if (!can_p2p and request.transport != .tcp_port_map and request.transport != .udp_port_map) {
+        if (!can_p2p and request.transport != .tcp_port_map and request.transport != .udp_port_map and !same_lan) {
             log.warn("NAT 类型不兼容，可能无法打洞成功", .{});
             log.warn("  发起方 NAT: {s}", .{from_client.nat_type.description()});
             log.warn("  目标方 NAT: {s}", .{target_client.nat_type.description()});
         }
 
         // 向目标客户端发送打洞开始通知
-        self.sendPunchBeginToClient(&target_client, from_client, &request) catch |e| {
+        self.sendPunchBeginToClient(&target_client, from_client, &request, same_lan) catch |e| {
             log.err("向目标客户端发送打洞通知失败: {any}", .{e});
             try self.sendPunchResponseToClient(from_client, false, .unknown, null);
             self.stats.failed_punches += 1;
@@ -593,7 +607,7 @@ pub const PunchServer = struct {
         };
 
         // 向发起方也发送打洞开始通知（包含目标信息）
-        self.sendPunchBeginToInitiator(from_client, &target_client, &request) catch |e| {
+        self.sendPunchBeginToInitiator(from_client, &target_client, &request, same_lan) catch |e| {
             log.err("向发起方发送打洞通知失败: {any}", .{e});
         };
 
@@ -601,7 +615,38 @@ pub const PunchServer = struct {
         try self.sendPunchResponseToClient(from_client, true, .success, null);
 
         self.stats.successful_punches += 1;
-        log.info("已通知双方开始打洞", .{});
+        if (same_lan) {
+            log.info("已通知双方开始内网直连", .{});
+        } else {
+            log.info("已通知双方开始打洞", .{});
+        }
+    }
+
+    /// 检测两个客户端是否在同一局域网
+    /// 通过比较它们的公网地址（或连接地址）来判断
+    fn isSameLan(self: *Self, client1: *const ClientInfo, client2: *const ClientInfo) bool {
+        _ = self;
+
+        // 获取两个客户端的公网地址
+        const addr1 = client1.public_addr orelse client1.local_addr;
+        const addr2 = client2.public_addr orelse client2.local_addr;
+
+        // 只比较 IP 地址，不比较端口
+        if (addr1.any.family != addr2.any.family) {
+            return false;
+        }
+
+        switch (addr1.any.family) {
+            posix.AF.INET => {
+                // IPv4: 比较 4 字节地址
+                return addr1.in.sa.addr == addr2.in.sa.addr;
+            },
+            posix.AF.INET6 => {
+                // IPv6: 比较 16 字节地址
+                return std.mem.eql(u8, &addr1.in6.sa.addr, &addr2.in6.sa.addr);
+            },
+            else => return false,
+        }
     }
 
     /// 发送打洞响应（使用 TLS）
@@ -641,7 +686,7 @@ pub const PunchServer = struct {
     }
 
     /// 向目标客户端发送打洞开始通知
-    fn sendPunchBeginToClient(self: *Self, target: *const ClientInfo, initiator: *const ClientInfo, request: *const protocol.PunchRequest) !void {
+    fn sendPunchBeginToClient(self: *Self, target: *const ClientInfo, initiator: *const ClientInfo, request: *const protocol.PunchRequest, same_lan: bool) !void {
         _ = self;
         var payload_buf: [512]u8 = undefined;
         var payload_stream = std.io.fixedBufferStream(&payload_buf);
@@ -669,18 +714,21 @@ pub const PunchServer = struct {
         // SSL
         try writer.writeByte(if (request.ssl) 1 else 0);
 
-        // 发起方公网地址 - 格式化为字符串
+        // 同局域网标志
+        try writer.writeByte(if (same_lan) 1 else 0);
+
+        // 发起方公网地址 - 使用正确的格式化函数
         var public_addr_buf: [64]u8 = undefined;
         const public_addr = if (initiator.public_addr) |addr|
-            std.fmt.bufPrint(&public_addr_buf, "{any}", .{addr}) catch "unknown"
+            ClientInfo.formatAddress(addr, &public_addr_buf)
         else
-            std.fmt.bufPrint(&public_addr_buf, "{any}", .{initiator.local_addr}) catch "unknown";
+            ClientInfo.formatAddress(initiator.local_addr, &public_addr_buf);
         try writer.writeInt(u16, @intCast(public_addr.len), .big);
         try writer.writeAll(public_addr);
 
         // 发起方本地地址
         var local_addr_buf: [64]u8 = undefined;
-        const local_addr = std.fmt.bufPrint(&local_addr_buf, "{any}", .{initiator.local_addr}) catch "unknown";
+        const local_addr = ClientInfo.formatAddress(initiator.local_addr, &local_addr_buf);
         try writer.writeInt(u16, @intCast(local_addr.len), .big);
         try writer.writeAll(local_addr);
 
@@ -704,11 +752,11 @@ pub const PunchServer = struct {
 
         try target.sendData(send_buf[0..total_len]);
 
-        log.info("已向目标 {s} 发送打洞开始通知，发起方: {s}", .{ target.machine_id, initiator.machine_id });
+        log.info("已向目标 {s} 发送打洞开始通知，发起方: {s}，同局域网: {s}", .{ target.machine_id, initiator.machine_id, if (same_lan) "是" else "否" });
     }
 
     /// 向发起方发送打洞开始通知（包含目标信息）
-    fn sendPunchBeginToInitiator(self: *Self, initiator: *const ClientInfo, target: *const ClientInfo, request: *const protocol.PunchRequest) !void {
+    fn sendPunchBeginToInitiator(self: *Self, initiator: *const ClientInfo, target: *const ClientInfo, request: *const protocol.PunchRequest, same_lan: bool) !void {
         _ = self;
         var payload_buf: [512]u8 = undefined;
         var payload_stream = std.io.fixedBufferStream(&payload_buf);
@@ -736,18 +784,21 @@ pub const PunchServer = struct {
         // SSL
         try writer.writeByte(if (request.ssl) 1 else 0);
 
-        // 目标公网地址
+        // 同局域网标志
+        try writer.writeByte(if (same_lan) 1 else 0);
+
+        // 目标公网地址 - 使用正确的格式化函数
         var public_addr_buf: [64]u8 = undefined;
         const public_addr = if (target.public_addr) |addr|
-            std.fmt.bufPrint(&public_addr_buf, "{any}", .{addr}) catch "unknown"
+            ClientInfo.formatAddress(addr, &public_addr_buf)
         else
-            std.fmt.bufPrint(&public_addr_buf, "{any}", .{target.local_addr}) catch "unknown";
+            ClientInfo.formatAddress(target.local_addr, &public_addr_buf);
         try writer.writeInt(u16, @intCast(public_addr.len), .big);
         try writer.writeAll(public_addr);
 
         // 目标本地地址
         var local_addr_buf: [64]u8 = undefined;
-        const local_addr = std.fmt.bufPrint(&local_addr_buf, "{any}", .{target.local_addr}) catch "unknown";
+        const local_addr = ClientInfo.formatAddress(target.local_addr, &local_addr_buf);
         try writer.writeInt(u16, @intCast(local_addr.len), .big);
         try writer.writeAll(local_addr);
 

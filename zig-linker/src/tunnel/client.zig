@@ -43,6 +43,18 @@ fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
     return fbs.getWritten();
 }
 
+/// 解析端点字符串为地址 (格式: ip:port 或 net.Address{...})
+fn parseEndpointString(endpoint_str: []const u8) ?net.Address {
+    // 尝试解析简单格式 "ip:port"
+    if (std.mem.lastIndexOfScalar(u8, endpoint_str, ':')) |colon_idx| {
+        const ip_str = endpoint_str[0..colon_idx];
+        const port_str = endpoint_str[colon_idx + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+        return net.Address.parseIp(ip_str, port) catch return null;
+    }
+    return null;
+}
+
 /// 客户端配置
 pub const ClientConfig = struct {
     /// 服务器地址
@@ -69,6 +81,8 @@ pub const ClientConfig = struct {
     tls_skip_verify: bool = false,
     /// 是否自动与新上线节点打洞
     auto_punch_on_peer_online: bool = false,
+    /// 传输方式配置列表（打洞方式优先级）
+    transports: []const config_mod.TransportConfig = &.{},
 };
 
 /// 打洞结果
@@ -857,18 +871,66 @@ pub const PunchClient = struct {
                     const loop_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
                     const begin = protocol.PunchBegin.parse(loop_payload) orelse continue;
 
+                    // 显示详细的打洞请求信息和 NAT 分析
                     log.info("", .{});
                     log.info("╔══════════════════════════════════════════════════════════════╗", .{});
-                    log.info("║              收到打洞请求                                     ║", .{});
+                    if (begin.same_lan) {
+                        log.info("║              收到内网直连请求                                 ║", .{});
+                    } else {
+                        log.info("║              收到打洞请求                                     ║", .{});
+                    }
                     log.info("╠══════════════════════════════════════════════════════════════╣", .{});
-                    log.info("║ 来自: {s}", .{begin.source_machine_id});
-                    log.info("║ NAT:  {s}", .{begin.source_nat_type.description()});
-                    log.info("║ 方式: {s}", .{begin.transport.description()});
-                    log.info("║ 方向: {s}", .{if (begin.direction == .forward) "正向" else "反向"});
+                    log.info("║ 对方节点 ID:   {s}", .{begin.source_machine_id});
+                    log.info("║ 对方 NAT 类型: {s}", .{begin.source_nat_type.description()});
+                    log.info("║ 本地 NAT 类型: {s}", .{self.local_nat_type.description()});
+                    log.info("║ 打洞方向:      {s}", .{if (begin.direction == .forward) "正向 (我方主动)" else "反向 (我方被动)"});
+                    log.info("║ 传输方式:      {s}", .{begin.transport.description()});
+                    log.info("║ 需要 SSL:      {s}", .{if (begin.ssl) "是" else "否"});
+                    log.info("║ 同一局域网:    {s}", .{if (begin.same_lan) "✓ 是" else "✗ 否"});
+                    if (begin.public_endpoint.len > 0) {
+                        log.info("║ 对方公网地址:  {s}", .{begin.public_endpoint});
+                    }
+                    if (begin.local_endpoint.len > 0) {
+                        log.info("║ 对方本地地址:  {s}", .{begin.local_endpoint});
+                    }
+                    log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+
+                    // NAT 类型兼容性分析
+                    if (begin.same_lan) {
+                        log.info("║ 连接策略:     ✓ 同局域网，将使用内网地址直连", .{});
+                    } else {
+                        const can_p2p = self.local_nat_type.canP2P(begin.source_nat_type);
+                        if (can_p2p) {
+                            log.info("║ NAT 兼容性:    ✓ 可直接 P2P 打洞", .{});
+                        } else {
+                            log.info("║ NAT 兼容性:    ✗ 难以直接 P2P，需要中继或端口映射", .{});
+                        }
+                    }
                     log.info("╚══════════════════════════════════════════════════════════════╝", .{});
 
+                    // 调用回调（如果有）
                     if (self.on_punch_request) |callback| {
                         callback(self, &begin);
+                    }
+
+                    // 执行实际打洞 - 使用配置的传输方式逐一尝试
+                    if (self.config.transports.len > 0) {
+                        log.info("", .{});
+                        if (begin.same_lan) {
+                            log.info("检测到同局域网，将优先尝试内网直连...", .{});
+                        } else {
+                            log.info("开始执行打洞流程，将按优先级尝试 {d} 种打洞方式...", .{self.config.transports.len});
+                        }
+
+                        const punch_result = self.executePunchWithPeerInfo(&begin) catch |e| {
+                            log.err("打洞执行失败: {any}", .{e});
+                            continue;
+                        };
+
+                        // 显示打洞结果
+                        self.printPunchResult(&punch_result, &begin);
+                    } else {
+                        log.warn("未配置打洞方式，无法执行实际打洞", .{});
                     }
                 },
                 .peer_online => {
@@ -933,6 +995,260 @@ pub const PunchClient = struct {
     /// 是否已连接
     pub fn isConnected(self: *const Self) bool {
         return self.server_socket != null and self.registered;
+    }
+
+    /// 使用对方信息执行打洞 - 根据收到的 PunchBegin 信息执行打洞
+    pub fn executePunchWithPeerInfo(self: *Self, begin: *const protocol.PunchBegin) !AutoPunchResult {
+        var result = AutoPunchResult{
+            .success = false,
+            .tried_methods = 0,
+            .successful_method = null,
+            .connection = null,
+            .total_duration_ms = 0,
+            .results = undefined,
+        };
+
+        const start_time = std.time.milliTimestamp();
+
+        log.info("", .{});
+        log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+        log.info("║              开始打洞流程                                    ║", .{});
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 目标节点:   {s}", .{begin.source_machine_id});
+        log.info("║ 目标 NAT:   {s}", .{begin.source_nat_type.description()});
+        log.info("║ 本地 NAT:   {s}", .{self.local_nat_type.description()});
+        log.info("║ 打洞方向:   {s}", .{if (begin.direction == .forward) "正向" else "反向"});
+        log.info("║ 待尝试方式: {d}", .{self.config.transports.len});
+        log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+        log.info("", .{});
+
+        var method_idx: usize = 0;
+        for (self.config.transports) |transport_config| {
+            if (!transport_config.enabled) {
+                log.debug("跳过已禁用的打洞方式: {s}", .{transport_config.name});
+                continue;
+            }
+
+            const transport_type = config_mod.ClientConfiguration.getTransportType(transport_config.name) orelse {
+                log.warn("未知的打洞方式: {s}", .{transport_config.name});
+                continue;
+            };
+
+            if (method_idx >= result.results.len) break;
+
+            result.tried_methods += 1;
+            const method_start = std.time.milliTimestamp();
+
+            log.info("┌──────────────────────────────────────────────────────────────┐", .{});
+            log.info("│ [{d}/{d}] 尝试: {s}", .{ result.tried_methods, self.config.transports.len, transport_config.name });
+            log.info("│ 优先级: {d}, 超时: {d}s, 重试: {d}次", .{
+                transport_config.priority,
+                transport_config.timeout_seconds,
+                transport_config.retry_count,
+            });
+            log.info("└──────────────────────────────────────────────────────────────┘", .{});
+
+            // 尝试打洞
+            var retry: u8 = 0;
+            var punch_success = false;
+            var punch_connection: ?transport_mod.ITunnelConnection = null;
+            var error_msg: []const u8 = "";
+
+            while (retry <= transport_config.retry_count) : (retry += 1) {
+                if (retry > 0) {
+                    log.info("  重试第 {d}/{d} 次...", .{ retry, transport_config.retry_count });
+                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                }
+
+                // 执行具体的打洞方式
+                const conn_result = self.tryPunchMethod(transport_type, begin, transport_config.timeout_seconds);
+
+                if (conn_result.success) {
+                    punch_success = true;
+                    punch_connection = conn_result.connection;
+                    log.info("  ✓ {s} 打洞成功!", .{transport_config.name});
+                    break;
+                } else {
+                    error_msg = conn_result.error_message;
+                    log.debug("  尝试 {s} 失败: {s}", .{ transport_config.name, error_msg });
+                }
+            }
+
+            const method_duration = @as(u64, @intCast(std.time.milliTimestamp() - method_start));
+
+            // 记录结果
+            result.results[method_idx] = .{
+                .transport_name = transport_config.name,
+                .success = punch_success,
+                .duration_ms = method_duration,
+                .error_message = error_msg,
+            };
+            method_idx += 1;
+
+            if (punch_success) {
+                result.success = true;
+                result.successful_method = transport_type;
+                result.connection = punch_connection;
+                break;
+            } else {
+                log.warn("  ✗ {s} 失败: {s} ({d}ms)", .{ transport_config.name, error_msg, method_duration });
+            }
+        }
+
+        result.total_duration_ms = @intCast(std.time.milliTimestamp() - start_time);
+        return result;
+    }
+
+    /// 尝试具体的打洞方式
+    fn tryPunchMethod(self: *Self, transport_type: types.TransportType, begin: *const protocol.PunchBegin, timeout_seconds: u16) PunchResult {
+        _ = timeout_seconds;
+
+        // 构建传输信息
+        const local_info = types.EndpointInfo{
+            .local = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+            .local_ips = &.{},
+            .machine_id = self.assigned_id,
+            .machine_name = self.config.machine_name,
+            .route_level = 8,
+            .port_map_wan = self.config.port_map_wan,
+            .port_map_lan = 0,
+            .nat_type = self.local_nat_type,
+        };
+
+        // 解析对方地址 - 如果是同局域网，优先使用本地地址
+        var remote_endpoints: [2]net.Address = undefined;
+        var remote_count: usize = 0;
+
+        if (begin.same_lan) {
+            // 同局域网：优先使用本地地址
+            if (begin.local_endpoint.len > 0) {
+                if (parseEndpointString(begin.local_endpoint)) |addr| {
+                    remote_endpoints[remote_count] = addr;
+                    remote_count += 1;
+                    log.debug("同局域网模式：使用本地地址 {s}", .{begin.local_endpoint});
+                }
+            }
+            // 备选：公网地址
+            if (begin.public_endpoint.len > 0) {
+                if (parseEndpointString(begin.public_endpoint)) |addr| {
+                    remote_endpoints[remote_count] = addr;
+                    remote_count += 1;
+                }
+            }
+        } else {
+            // 跨网络：优先使用公网地址
+            if (begin.public_endpoint.len > 0) {
+                if (parseEndpointString(begin.public_endpoint)) |addr| {
+                    remote_endpoints[remote_count] = addr;
+                    remote_count += 1;
+                }
+            }
+            if (begin.local_endpoint.len > 0) {
+                if (parseEndpointString(begin.local_endpoint)) |addr| {
+                    remote_endpoints[remote_count] = addr;
+                    remote_count += 1;
+                }
+            }
+        }
+
+        if (remote_count == 0) {
+            return PunchResult{
+                .success = false,
+                .error_message = "无法解析对方地址",
+                .duration_ms = 0,
+            };
+        }
+
+        const remote_info = types.EndpointInfo{
+            .local = remote_endpoints[0],
+            .local_ips = &.{},
+            .machine_id = begin.source_machine_id,
+            .machine_name = "",
+            .route_level = 8,
+            .port_map_wan = 0,
+            .port_map_lan = 0,
+            .nat_type = begin.source_nat_type,
+        };
+
+        const transport_info = types.TunnelTransportInfo{
+            .transport_name = transport_type,
+            .direction = begin.direction,
+            .ssl = begin.ssl,
+            .local = local_info,
+            .remote = remote_info,
+            .remote_endpoints = remote_endpoints[0..remote_count],
+            .transaction_id = &begin.transaction_id,
+            .flow_id = begin.flow_id,
+        };
+
+        log.debug("正在尝试 {s} 打洞，方向: {s}，目标地址: {d} 个", .{
+            transport_type.description(),
+            if (begin.direction == .forward) "正向" else "反向",
+            remote_count,
+        });
+
+        // 调用传输管理器执行打洞
+        const connection = self.transport_manager.connect(transport_type, &transport_info) catch |e| {
+            const err_msg = switch (e) {
+                error.Timeout, error.WouldBlock => "连接超时",
+                error.ConnectionRefused => "连接被拒绝",
+                else => "连接失败",
+            };
+            return PunchResult{
+                .success = false,
+                .error_message = err_msg,
+                .duration_ms = 0,
+            };
+        };
+
+        if (connection) |conn| {
+            return PunchResult{
+                .success = true,
+                .connection = conn,
+                .error_message = "",
+                .duration_ms = 0,
+            };
+        }
+
+        return PunchResult{
+            .success = false,
+            .error_message = "打洞未成功",
+            .duration_ms = 0,
+        };
+    }
+
+    /// 打印打洞结果汇总
+    fn printPunchResult(self: *const Self, result: *const AutoPunchResult, begin: *const protocol.PunchBegin) void {
+        _ = self;
+        log.info("", .{});
+        log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+        if (result.success) {
+            log.info("║           打洞完成 - 成功 ✓                                   ║", .{});
+        } else {
+            log.info("║           打洞完成 - 失败 ✗                                   ║", .{});
+        }
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 目标节点:     {s}", .{begin.source_machine_id});
+        log.info("║ 对方 NAT:     {s}", .{begin.source_nat_type.description()});
+        log.info("║ 尝试方式数:   {d}", .{result.tried_methods});
+        log.info("║ 总耗时:       {d} ms", .{result.total_duration_ms});
+        if (result.successful_method) |method| {
+            log.info("║ 成功方式:     {s}", .{method.description()});
+        }
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 各方式尝试结果:", .{});
+
+        var i: usize = 0;
+        while (i < result.tried_methods and i < result.results.len) : (i += 1) {
+            const r = result.results[i];
+            const status = if (r.success) "✓" else "✗";
+            if (r.error_message.len > 0) {
+                log.info("║   {s} {s}: {d}ms - {s}", .{ status, r.transport_name, r.duration_ms, r.error_message });
+            } else {
+                log.info("║   {s} {s}: {d}ms", .{ status, r.transport_name, r.duration_ms });
+            }
+        }
+        log.info("╚══════════════════════════════════════════════════════════════╝", .{});
     }
 
     /// 自动打洞 - 按配置文件中的优先级顺序尝试所有打洞方式
@@ -1209,6 +1525,8 @@ pub fn main() !void {
         .tls_skip_verify = cmd_tls_skip_verify orelse !config_manager.config.tls.verify_server,
         // 自动打洞：命令行 --auto-punch 或配置文件中启用
         .auto_punch_on_peer_online = auto_mode or config_manager.config.auto_punch_on_peer_online,
+        // 传输方式配置
+        .transports = config_manager.config.transports,
     };
 
     log.info("", .{});
