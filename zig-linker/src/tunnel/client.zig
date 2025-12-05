@@ -1107,39 +1107,76 @@ pub const PunchClient = struct {
 
                     if (connection) |conn| {
                         const remote_addr_str = log.formatAddress(conn.info.remote_endpoint);
-                        log.info("========== 被动打洞成功 ==========", .{});
+                        log.info("========== 打洞成功 ==========", .{});
                         log.info("传输方式: {s}", .{begin.transport.description()});
                         log.info("耗时: {d} ms", .{duration});
                         log.info("远程端点: {s}", .{std.mem.sliceTo(&remote_addr_str, 0)});
-                        log.info("==================================", .{});
+                        log.info("方向: {s}", .{if (begin.direction == .forward) "正向 (我方主动)" else "反向 (我方被动)"});
+                        log.info("==============================", .{});
 
                         var mutable_conn = conn;
-
-                        // 发送 Hello 消息
                         const hello_msg = "Hello";
-                        log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_msg });
-                        _ = mutable_conn.send(hello_msg) catch |e| {
-                            log.err("发送消息失败: {any}", .{e});
-                        };
+                        var hello_recv_buf: [256]u8 = undefined;
 
-                        // 接收对方的 Hello 消息
-                        var recv_hello_buf: [256]u8 = undefined;
-                        if (mutable_conn.recvWithTimeout(&recv_hello_buf, 2000)) |recv_hello_len| {
-                            if (recv_hello_len > 0) {
-                                log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, recv_hello_buf[0..recv_hello_len] });
+                        // 清空 UDP 缓冲区中的打洞协议残留数据
+                        // 循环读取直到没有数据或超时
+                        var flush_count: u32 = 0;
+                        while (flush_count < 10) : (flush_count += 1) {
+                            if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |flush_len| {
+                                if (flush_len == 0) break;
+                                // 检查是否是协议数据（以 "linker.zig" 开头）
+                                if (flush_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..flush_len], "linker.zig")) {
+                                    log.debug("清除协议残留数据: {s}", .{hello_recv_buf[0..flush_len]});
+                                    continue;
+                                }
+                                // 不是协议数据，可能是对方的 Hello，退出清空循环
+                                break;
+                            } else |_| {
+                                // 超时，缓冲区已空
+                                break;
                             }
-                        } else |_| {
-                            log.warn("接收对方消息超时", .{});
                         }
 
-                        // 注意：不关闭连接，保持隧道可用
+                        // 双向消息测试：根据方向决定先发还是先收
+                        // forward (主动方): 先发 Hello，再收 Hello
+                        // reverse (被动方): 先收 Hello，再发 Hello
+                        if (begin.direction == .forward) {
+                            // 主动方：先发后收
+                            log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_msg });
+                            _ = mutable_conn.send(hello_msg) catch |e| {
+                                log.err("发送消息失败: {any}", .{e});
+                            };
+
+                            if (mutable_conn.recvWithTimeout(&hello_recv_buf, 3000)) |hello_len| {
+                                if (hello_len > 0) {
+                                    log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
+                                }
+                            } else |_| {
+                                log.warn("接收对方消息超时", .{});
+                            }
+                        } else {
+                            // 被动方：先收后发
+                            if (mutable_conn.recvWithTimeout(&hello_recv_buf, 3000)) |hello_len| {
+                                if (hello_len > 0) {
+                                    log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
+                                }
+                            } else |_| {
+                                log.warn("接收对方消息超时", .{});
+                            }
+
+                            log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_msg });
+                            _ = mutable_conn.send(hello_msg) catch |e| {
+                                log.err("发送消息失败: {any}", .{e});
+                            };
+                        }
+
                         log.info("隧道连接已建立，保持活跃状态", .{});
                         // TODO: 将 connection 保存到连接池中供后续使用
                     } else {
-                        log.err("========== 被动打洞失败 ==========", .{});
+                        log.err("========== 打洞失败 ==========", .{});
                         log.err("传输方式: {s}", .{begin.transport.description()});
                         log.err("耗时: {d} ms", .{duration});
-                        log.err("==================================", .{});
+                        log.err("==============================", .{});
                     }
                 },
                 .peer_online => {
