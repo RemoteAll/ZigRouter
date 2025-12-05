@@ -311,56 +311,74 @@ pub const TransportUdp = struct {
         // 设置接收超时
         try net_utils.setRecvTimeout(sock, self.config.auth_timeout_ms);
 
-        // 向对方发送认证消息
-        for (info.remote_endpoints) |ep| {
-            log.logConnectAttempt(ep, 1);
-            _ = posix.sendto(sock, UDP_AUTH_BYTES, 0, &ep.any, ep.getOsSockLen()) catch continue;
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
-
         // 等待对方回复
         var recv_buf: [1024]u8 = undefined;
         var from_addr: posix.sockaddr = undefined;
         var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
-        const recv_len = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len) catch |e| {
-            log.err("UDP 正向连接失败: 接收超时或错误: {any}", .{e});
-            log.logPunchFailed(.udp, "接收响应超时");
-            return null;
-        };
+        // 进行多次重试，每次发送后等待响应
+        var retry: u32 = 0;
+        while (retry < self.config.retry_count) : (retry += 1) {
+            // 向对方发送认证消息
+            for (info.remote_endpoints) |ep| {
+                log.logConnectAttempt(ep, retry + 1);
+                _ = posix.sendto(sock, UDP_AUTH_BYTES, 0, &ep.any, ep.getOsSockLen()) catch continue;
+            }
 
-        if (recv_len == 0) {
-            log.logPunchFailed(.udp, "收到空响应");
-            return null;
+            // 等待短暂时间后尝试接收
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+
+            const recv_len = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len) catch |e| {
+                // ConnectionResetByPeer 在 Windows 上表示对方端口不可达，继续重试
+                if (e == error.ConnectionResetByPeer) {
+                    log.debug("UDP 正向连接: 收到 ICMP 不可达，重试 ({d}/{d})", .{ retry + 1, self.config.retry_count });
+                    continue;
+                }
+                // WouldBlock 表示超时，继续重试
+                if (e == error.WouldBlock) {
+                    log.debug("UDP 正向连接: 等待超时，重试 ({d}/{d})", .{ retry + 1, self.config.retry_count });
+                    continue;
+                }
+                log.err("UDP 正向连接失败: 接收错误: {any}", .{e});
+                log.logPunchFailed(.udp, "接收响应错误");
+                return null;
+            };
+
+            if (recv_len == 0) continue;
+
+            // 发送结束确认
+            _ = posix.sendto(sock, UDP_END_BYTES, 0, &from_addr, from_len) catch {};
+
+            const remote_ep = net.Address{ .any = from_addr };
+            const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
+
+            const addr_str = log.formatAddress(remote_ep_converted);
+            log.info("UDP 打洞成功! 远程端点: {s}", .{std.mem.sliceTo(&addr_str, 0)});
+
+            const connection = ITunnelConnection{
+                .info = types.TunnelConnectionInfo{
+                    .remote_endpoint = remote_ep_converted,
+                    .remote_machine_id = info.remote.machine_id,
+                    .remote_machine_name = info.remote.machine_name,
+                    .transport_name = .udp,
+                    .direction = info.direction,
+                    .protocol_type = .udp,
+                    .tunnel_type = .p2p,
+                    .mode = .client,
+                    .ssl = info.ssl,
+                    .connected_at = std.time.timestamp(),
+                },
+                .socket = sock,
+                .connected = true,
+            };
+
+            log.logPunchSuccess(.udp, connection.info);
+            return connection;
         }
 
-        // 发送结束确认
-        _ = posix.sendto(sock, UDP_END_BYTES, 0, &from_addr, from_len) catch {};
-
-        const remote_ep = net.Address{ .any = from_addr };
-        const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
-
-        log.info("UDP 打洞成功! 远程端点: {any}", .{remote_ep_converted});
-
-        const connection = ITunnelConnection{
-            .info = types.TunnelConnectionInfo{
-                .remote_endpoint = remote_ep_converted,
-                .remote_machine_id = info.remote.machine_id,
-                .remote_machine_name = info.remote.machine_name,
-                .transport_name = .udp,
-                .direction = info.direction,
-                .protocol_type = .udp,
-                .tunnel_type = .p2p,
-                .mode = .client,
-                .ssl = info.ssl,
-                .connected_at = std.time.timestamp(),
-            },
-            .socket = sock,
-            .connected = true,
-        };
-
-        log.logPunchSuccess(.udp, connection.info);
-        return connection;
+        log.err("UDP 正向连接失败: 重试次数用尽", .{});
+        log.logPunchFailed(.udp, "接收响应超时");
+        return null;
     }
 
     /// 反向连接实现
@@ -382,14 +400,28 @@ pub const TransportUdp = struct {
         var from_addr: posix.sockaddr = undefined;
         var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
         var got_auth = false; // 是否收到过认证消息
+        var reset_count: u32 = 0; // 统计 ConnectionResetByPeer 次数
 
         while (true) {
             const recv_len = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len) catch |e| {
+                // WouldBlock 表示超时
                 if (e == error.WouldBlock) {
                     log.logPunchFailed(.udp, "等待连接超时");
                     return null;
                 }
-                return e;
+                // ConnectionResetByPeer 在 Windows 上表示我们发送的 TTL 包被目标拒绝
+                // 这是正常的打洞过程，忽略并继续等待
+                if (e == error.ConnectionResetByPeer) {
+                    reset_count += 1;
+                    if (reset_count >= 10) {
+                        log.logPunchFailed(.udp, "收到过多 ICMP 不可达消息");
+                        return null;
+                    }
+                    log.debug("UDP 反向连接: 收到 ICMP 不可达，继续等待 ({d}/10)", .{reset_count});
+                    continue;
+                }
+                log.err("UDP 反向连接失败: {any}", .{e});
+                return null;
             };
 
             if (recv_len == 0) continue;
@@ -401,7 +433,8 @@ pub const TransportUdp = struct {
             if (std.mem.eql(u8, data, UDP_END_BYTES)) {
                 const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
 
-                log.info("UDP 反向打洞成功! 远程端点: {any}", .{remote_ep_converted});
+                const addr_str = log.formatAddress(remote_ep_converted);
+                log.info("UDP 反向打洞成功! 远程端点: {s}", .{std.mem.sliceTo(&addr_str, 0)});
 
                 const connection = ITunnelConnection{
                     .info = types.TunnelConnectionInfo{
@@ -490,12 +523,15 @@ pub const TransportUdp = struct {
     }
 
     /// 收到打洞开始通知时的处理
+    /// 被动方收到 Begin 通知，direction 表示的是对方的方向：
+    /// - direction == forward: 对方是发起方，我是被动方，需要监听
+    /// - direction == reverse: 对方是被动方，我是发起方，需要连接
     pub fn onBegin(self: *Self, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
-        if (info.direction == .forward) {
-            // 对方要连我，我监听等待
+        if (info.direction == .reverse) {
+            // 我是被动方，监听等待对方连接
             return try self.connectReverse(info);
         } else {
-            // 我要去连对方
+            // 我是发起方，主动连接
             return try self.connectForward(info);
         }
     }
@@ -612,7 +648,8 @@ pub const TransportUdpP2PNAT = struct {
 
                     const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
 
-                    log.info("UDP P2PNAT 打洞成功! 远程端点: {any}", .{remote_ep_converted});
+                    const addr_str = log.formatAddress(remote_ep_converted);
+                    log.info("UDP P2PNAT 打洞成功! 远程端点: {s}", .{std.mem.sliceTo(&addr_str, 0)});
 
                     const connection = ITunnelConnection{
                         .info = types.TunnelConnectionInfo{
@@ -740,7 +777,8 @@ pub const TransportTcpP2PNAT = struct {
 
         const remote_ep_converted = net_utils.convertMappedAddress(ep);
 
-        log.info("TCP P2PNAT 打洞成功! 远程端点: {any}", .{remote_ep_converted});
+        const addr_str = log.formatAddress(remote_ep_converted);
+        log.info("TCP P2PNAT 打洞成功! 远程端点: {s}", .{std.mem.sliceTo(&addr_str, 0)});
 
         const connection = ITunnelConnection{
             .info = types.TunnelConnectionInfo{
@@ -832,7 +870,8 @@ pub const TransportTcpNutssb = struct {
 
             const remote_ep_converted = net_utils.convertMappedAddress(ep);
 
-            log.info("TCP Nutssb 连接成功! 远程端点: {any}", .{remote_ep_converted});
+            const addr_str = log.formatAddress(remote_ep_converted);
+            log.info("TCP Nutssb 连接成功! 远程端点: {s}", .{std.mem.sliceTo(&addr_str, 0)});
 
             const connection = ITunnelConnection{
                 .info = types.TunnelConnectionInfo{
@@ -1438,7 +1477,7 @@ pub const TransportManager = struct {
         };
     }
 
-    /// 使用指定传输方式连接
+    /// 使用指定传输方式连接 (发起方使用)
     pub fn connect(self: *Self, transport_type: types.TransportType, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
         return switch (transport_type) {
             .udp => try self.udp.connectAsync(info),
@@ -1448,6 +1487,20 @@ pub const TransportManager = struct {
             .udp_port_map => try self.udp_port_map.connectAsync(info),
             .tcp_port_map => try self.tcp_port_map.connectAsync(info),
             .msquic => try self.msquic.connectAsync(info),
+        };
+    }
+
+    /// 响应打洞开始通知 (被动方使用)
+    /// 被动方收到服务器下发的 Begin 消息后，必须使用发起方指定的传输方式来响应
+    pub fn onBegin(self: *Self, transport_type: types.TransportType, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
+        return switch (transport_type) {
+            .udp => try self.udp.onBegin(info),
+            .udp_p2p_nat => try self.udp_p2p_nat.onBegin(info),
+            .tcp_p2p_nat => try self.tcp_p2p_nat.onBegin(info),
+            .tcp_nutssb => try self.tcp_nutssb.onBegin(info),
+            .udp_port_map => try self.udp_port_map.onBegin(info),
+            .tcp_port_map => try self.tcp_port_map.onBegin(info),
+            .msquic => try self.msquic.onBegin(info),
         };
     }
 };

@@ -304,15 +304,40 @@ pub fn setRecvBufferSize(sock: posix.socket_t, size: u32) SocketOptionError!void
 /// Windows UDP 连接重置 bug 修复
 /// 在 Windows 上，当 UDP 发送到不存在的端口时会产生 WSAECONNRESET 错误
 /// 需要设置 SIO_UDP_CONNRESET 来禁用这个行为
+/// 参考: https://docs.microsoft.com/en-us/windows/win32/winsock/winsock-ioctls
 pub fn windowsUdpBugFix(sock: posix.socket_t) void {
     if (builtin.os.tag != .windows) {
         return;
     }
+
     // Windows 特定的 IOCtl 调用
-    // SIO_UDP_CONNRESET = 0x9800000C
-    // 这里简化处理，实际需要调用 WSAIoctl
-    _ = sock;
-    log.debug("Windows UDP bug fix applied", .{});
+    // SIO_UDP_CONNRESET = IOC_IN | IOC_VENDOR | 12 = 0x80000000 | 0x18000000 | 12 = 0x9800000C
+    // 设置为 FALSE (0) 来禁用 ICMP port unreachable 导致的 WSAECONNRESET 错误
+    const SIO_UDP_CONNRESET: u32 = 0x9800000C;
+    var new_behavior: u32 = 0; // FALSE，禁用连接重置报告
+    var bytes_returned: u32 = 0;
+
+    // 使用 WSAIoctl 设置 socket 选项
+    // Zig 的 std.os.windows.ws2_32 提供了 WSAIoctl 的绑定
+    const ws2_32 = std.os.windows.ws2_32;
+    const result = ws2_32.WSAIoctl(
+        sock,
+        SIO_UDP_CONNRESET,
+        @ptrCast(&new_behavior),
+        @sizeOf(@TypeOf(new_behavior)),
+        null,
+        0,
+        &bytes_returned,
+        null,
+        null,
+    );
+
+    if (result == ws2_32.SOCKET_ERROR) {
+        const err = ws2_32.WSAGetLastError();
+        log.debug("Windows UDP bug fix WSAIoctl failed: error code {d}", .{@intFromEnum(err)});
+    } else {
+        log.debug("Windows UDP bug fix applied successfully", .{});
+    }
 }
 
 /// 创建带有端口复用的 UDP Socket

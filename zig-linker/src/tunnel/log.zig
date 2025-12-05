@@ -118,6 +118,31 @@ pub fn err(comptime format: []const u8, args: anytype) void {
     LogWriter.log(.err, @src(), format, args);
 }
 
+/// 格式化网络地址为可读字符串
+pub fn formatAddress(addr: std.net.Address) [64]u8 {
+    var buf: [64]u8 = undefined;
+    @memset(&buf, 0);
+
+    // 手动格式化 IP:端口
+    switch (addr.any.family) {
+        std.posix.AF.INET => {
+            const ip_bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
+            const port = std.mem.bigToNative(u16, addr.in.sa.port);
+            _ = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}:{d}", .{
+                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], port,
+            }) catch {};
+        },
+        std.posix.AF.INET6 => {
+            const port = std.mem.bigToNative(u16, addr.in6.sa.port);
+            _ = std.fmt.bufPrint(&buf, "[IPv6]:{d}", .{port}) catch {};
+        },
+        else => {
+            @memcpy(buf[0..9], "<unknown>");
+        },
+    }
+    return buf;
+}
+
 /// 打洞相关的专用日志函数
 /// 记录打洞开始
 pub fn logPunchStart(transport: types.TransportType, direction: types.TunnelDirection, local: types.EndpointInfo, remote: types.EndpointInfo) void {
@@ -128,9 +153,11 @@ pub fn logPunchStart(transport: types.TransportType, direction: types.TunnelDire
     info("  - 机器ID: {s}", .{if (local.machine_id.len > 0) local.machine_id else "(未设置)"});
     info("  - 机器名: {s}", .{if (local.machine_name.len > 0) local.machine_name else "(未设置)"});
     info("  - NAT类型: {s}", .{local.nat_type.description()});
-    info("  - 本地地址: {any}", .{local.local});
+    const local_local_str = formatAddress(local.local);
+    info("  - 本地地址: {s}", .{std.mem.sliceTo(&local_local_str, 0)});
     if (local.remote) |r| {
-        info("  - 外网地址: {any}", .{r});
+        const local_remote_str = formatAddress(r);
+        info("  - 外网地址: {s}", .{std.mem.sliceTo(&local_remote_str, 0)});
     }
     info("  - 路由层级: {d}", .{local.route_level});
     if (local.port_map_wan != 0) {
@@ -141,9 +168,11 @@ pub fn logPunchStart(transport: types.TransportType, direction: types.TunnelDire
     info("  - 机器ID: {s}", .{if (remote.machine_id.len > 0) remote.machine_id else "(未设置)"});
     info("  - 机器名: {s}", .{if (remote.machine_name.len > 0) remote.machine_name else "(未设置)"});
     info("  - NAT类型: {s}", .{remote.nat_type.description()});
-    info("  - 本地地址: {any}", .{remote.local});
+    const remote_local_str = formatAddress(remote.local);
+    info("  - 本地地址: {s}", .{std.mem.sliceTo(&remote_local_str, 0)});
     if (remote.remote) |r| {
-        info("  - 外网地址: {any}", .{r});
+        const remote_remote_str = formatAddress(r);
+        info("  - 外网地址: {s}", .{std.mem.sliceTo(&remote_remote_str, 0)});
     }
     info("  - 路由层级: {d}", .{remote.route_level});
     info("==============================", .{});
@@ -157,7 +186,8 @@ pub fn logPunchSuccess(transport: types.TransportType, connection: types.TunnelC
         if (connection.remote_machine_id.len > 0) connection.remote_machine_id else "(未知)",
         if (connection.remote_machine_name.len > 0) connection.remote_machine_name else "(未知)",
     });
-    info("远程端点: {any}", .{connection.remote_endpoint});
+    const remote_ep_str = formatAddress(connection.remote_endpoint);
+    info("远程端点: {s}", .{std.mem.sliceTo(&remote_ep_str, 0)});
     info("隧道类型: {s}", .{connection.tunnel_type.toString()});
     info("模式: {s}", .{connection.mode.toString()});
     info("协议: {s}", .{connection.protocol_type.toString()});

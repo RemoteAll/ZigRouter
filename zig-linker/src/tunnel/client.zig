@@ -511,16 +511,48 @@ pub const PunchClient = struct {
         var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
         try header.serialize(&header_buf);
 
-        _ = try posix.send(sock, &header_buf, 0);
-        _ = try posix.send(sock, payload, 0);
+        // 合并 header 和 payload 一起发送
+        var send_buf: [1024]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload_len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload_len;
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = tc.send(send_buf[0..total_len]) catch {
+                return PunchResult{
+                    .success = false,
+                    .error_message = "TLS发送失败",
+                    .duration_ms = @intCast(std.time.milliTimestamp() - start_time),
+                };
+            };
+        } else {
+            _ = posix.send(sock, send_buf[0..total_len], 0) catch {
+                return PunchResult{
+                    .success = false,
+                    .error_message = "发送失败",
+                    .duration_ms = @intCast(std.time.milliTimestamp() - start_time),
+                };
+            };
+        }
 
         // 等待打洞开始通知
         var recv_buf: [4096]u8 = undefined;
-        const recv_len = posix.recv(sock, &recv_buf, 0) catch {
-            return PunchResult{
-                .success = false,
-                .error_message = "接收响应失败",
-                .duration_ms = @intCast(std.time.milliTimestamp() - start_time),
+        const recv_len = if (self.tls_conn) |*tc| blk: {
+            break :blk tc.recv(&recv_buf) catch {
+                return PunchResult{
+                    .success = false,
+                    .error_message = "TLS接收响应失败",
+                    .duration_ms = @intCast(std.time.milliTimestamp() - start_time),
+                };
+            };
+        } else blk: {
+            break :blk posix.recv(sock, &recv_buf, 0) catch {
+                return PunchResult{
+                    .success = false,
+                    .error_message = "接收响应失败",
+                    .duration_ms = @intCast(std.time.milliTimestamp() - start_time),
+                };
             };
         };
 
@@ -913,52 +945,121 @@ pub const PunchClient = struct {
                         callback(self, &begin);
                     }
 
-                    // 执行实际打洞 - 使用配置的传输方式逐一尝试
-                    if (self.config.transports.len > 0) {
-                        log.info("", .{});
-                        if (begin.same_lan) {
-                            log.info("检测到同局域网，将优先尝试内网直连...", .{});
-                        } else {
-                            log.info("开始执行打洞流程，将按优先级尝试 {d} 种打洞方式...", .{self.config.transports.len});
-                        }
+                    // 被动方响应打洞 - 必须使用发起方指定的传输方式
+                    // 不能自己选择打洞方式，必须配合发起方！
+                    log.info("", .{});
+                    log.info("响应打洞请求，使用发起方指定的方式: {s}", .{begin.transport.description()});
 
-                        const punch_result = self.executePunchWithPeerInfo(&begin) catch |e| {
-                            log.err("打洞执行失败: {any}", .{e});
+                    // 解析对方地址
+                    var remote_endpoints: [4]net.Address = undefined;
+                    var endpoint_count: usize = 0;
+
+                    // 从 begin 消息中解析地址
+                    if (begin.local_endpoint.len > 0) {
+                        if (parseEndpointString(begin.local_endpoint)) |addr| {
+                            remote_endpoints[endpoint_count] = addr;
+                            endpoint_count += 1;
+                            const addr_str = log.formatAddress(addr);
+                            log.info("  对方本地地址: {s}", .{std.mem.sliceTo(&addr_str, 0)});
+                        }
+                    }
+                    if (begin.public_endpoint.len > 0) {
+                        if (parseEndpointString(begin.public_endpoint)) |addr| {
+                            remote_endpoints[endpoint_count] = addr;
+                            endpoint_count += 1;
+                            const addr_str = log.formatAddress(addr);
+                            log.info("  对方公网地址: {s}", .{std.mem.sliceTo(&addr_str, 0)});
+                        }
+                    }
+
+                    if (endpoint_count == 0) {
+                        log.err("没有可用的对方端点地址", .{});
+                        continue;
+                    }
+
+                    // 构造传输信息
+                    // direction 保持原样：forward 表示我是发起方，reverse 表示我是被动方
+                    const transport_info = types.TunnelTransportInfo{
+                        .flow_id = begin.flow_id,
+                        .direction = begin.direction,
+                        .local = types.EndpointInfo{
+                            .machine_id = self.assigned_id,
+                            .machine_name = self.config.machine_name,
+                            .nat_type = self.local_nat_type,
+                            .local = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                            .local_ips = &.{},
+                            .remote = self.public_addr,
+                            .port_map_wan = self.config.port_map_wan,
+                            .port_map_lan = 0,
+                            .route_level = 8,
+                        },
+                        .remote = types.EndpointInfo{
+                            .machine_id = begin.source_machine_id,
+                            .machine_name = "",
+                            .nat_type = begin.source_nat_type,
+                            .local = remote_endpoints[0],
+                            .local_ips = &.{},
+                            .remote = if (endpoint_count > 1) remote_endpoints[1] else null,
+                            .port_map_wan = 0,
+                            .port_map_lan = 0,
+                            .route_level = 8,
+                        },
+                        .remote_endpoints = remote_endpoints[0..endpoint_count],
+                        .ssl = begin.ssl,
+                    };
+
+                    const start_time = std.time.milliTimestamp();
+
+                    // 根据方向选择正确的方法：
+                    // - forward: 我是发起方，用 connect()
+                    // - reverse: 我是被动方，用 onBegin()
+                    const connection = if (begin.direction == .forward)
+                        self.transport_manager.connect(begin.transport, &transport_info) catch |e| {
+                            log.err("发起打洞失败: {any}", .{e});
+                            continue;
+                        }
+                    else
+                        self.transport_manager.onBegin(begin.transport, &transport_info) catch |e| {
+                            log.err("响应打洞失败: {any}", .{e});
                             continue;
                         };
 
-                        // 显示打洞结果
-                        self.printPunchResult(&punch_result, &begin);
+                    const duration = @as(u64, @intCast(std.time.milliTimestamp() - start_time));
 
-                        // 打洞成功后发送/接收 Hello 消息进行验证
-                        if (punch_result.success) {
-                            if (punch_result.connection) |*conn| {
-                                var connection = conn.*;
+                    if (connection) |conn| {
+                        log.info("========== 被动打洞成功 ==========", .{});
+                        log.info("传输方式: {s}", .{begin.transport.description()});
+                        log.info("耗时: {d} ms", .{duration});
+                        log.info("远程端点: {any}", .{conn.info.remote_endpoint});
+                        log.info("==================================", .{});
 
-                                // 发送 Hello 消息
-                                const hello_msg = "Hello";
-                                log.info(">>> 发送消息: {s}", .{hello_msg});
-                                _ = connection.send(hello_msg) catch |e| {
-                                    log.err("发送消息失败: {any}", .{e});
-                                };
+                        var mutable_conn = conn;
 
-                                // 接收对方的 Hello 消息
-                                var recv_hello_buf: [256]u8 = undefined;
-                                if (connection.recvWithTimeout(&recv_hello_buf, 2000)) |recv_hello_len| {
-                                    if (recv_hello_len > 0) {
-                                        log.info("<<< 收到消息: {s}", .{recv_hello_buf[0..recv_hello_len]});
-                                    }
-                                } else |_| {
-                                    log.warn("接收对方消息超时", .{});
-                                }
+                        // 发送 Hello 消息
+                        const hello_msg = "Hello";
+                        log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_msg });
+                        _ = mutable_conn.send(hello_msg) catch |e| {
+                            log.err("发送消息失败: {any}", .{e});
+                        };
 
-                                // 注意：不关闭连接，保持隧道可用
-                                log.info("隧道连接已建立，保持活跃状态", .{});
-                                // TODO: 将 connection 保存到连接池中供后续使用
+                        // 接收对方的 Hello 消息
+                        var recv_hello_buf: [256]u8 = undefined;
+                        if (mutable_conn.recvWithTimeout(&recv_hello_buf, 2000)) |recv_hello_len| {
+                            if (recv_hello_len > 0) {
+                                log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, recv_hello_buf[0..recv_hello_len] });
                             }
+                        } else |_| {
+                            log.warn("接收对方消息超时", .{});
                         }
+
+                        // 注意：不关闭连接，保持隧道可用
+                        log.info("隧道连接已建立，保持活跃状态", .{});
+                        // TODO: 将 connection 保存到连接池中供后续使用
                     } else {
-                        log.warn("未配置打洞方式，无法执行实际打洞", .{});
+                        log.err("========== 被动打洞失败 ==========", .{});
+                        log.err("传输方式: {s}", .{begin.transport.description()});
+                        log.err("耗时: {d} ms", .{duration});
+                        log.err("==================================", .{});
                     }
                 },
                 .peer_online => {
@@ -1489,10 +1590,8 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var config_path: []const u8 = "punch_client.json";
-    var target_id: ?[]const u8 = null;
-    var transport_str: ?[]const u8 = null;
     var list_only = false;
-    var auto_mode = false;
+    var auto_punch = false;
     var cmd_server_addr: ?[]const u8 = null;
     var cmd_server_port: ?u16 = null;
     var cmd_machine_name: ?[]const u8 = null;
@@ -1531,21 +1630,9 @@ pub fn main() !void {
                 cmd_machine_name = args[i + 1];
                 i += 1;
             }
-        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--target")) {
-            if (i + 1 < args.len) {
-                target_id = args[i + 1];
-                i += 1;
-            }
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--method")) {
-            if (i + 1 < args.len) {
-                transport_str = args[i + 1];
-                i += 1;
-            }
-        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--auto")) {
-            auto_mode = true;
         } else if (std.mem.eql(u8, arg, "--auto-punch")) {
             // 自动与新上线节点打洞
-            auto_mode = true;
+            auto_punch = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
             list_only = true;
         } else if (std.mem.eql(u8, arg, "--tls")) {
@@ -1591,7 +1678,7 @@ pub fn main() !void {
         .tls_enabled = cmd_tls_enabled orelse config_manager.config.tls.enabled,
         .tls_skip_verify = cmd_tls_skip_verify orelse !config_manager.config.tls.verify_server,
         // 自动打洞：命令行 --auto-punch 或配置文件中启用
-        .auto_punch_on_peer_online = auto_mode or config_manager.config.auto_punch_on_peer_online,
+        .auto_punch_on_peer_online = auto_punch or config_manager.config.auto_punch_on_peer_online,
         // 传输方式配置
         .transports = config_manager.config.transports,
     };
@@ -1651,79 +1738,12 @@ pub fn main() !void {
         }
         log.info("└────┴──────────────────┴──────────────────┴─────────────────────┘", .{});
         log.info("", .{});
-    } else if (target_id) |tid| {
-        if (auto_mode or transport_str == null) {
-            // 自动模式：按配置顺序尝试所有打洞方式
-            log.info("使用自动模式，将按配置顺序尝试所有打洞方式", .{});
-
-            const result = try client.autoPunch(tid, config_manager.config.transports);
-
-            if (result.success) {
-                log.info("自动打洞成功! 可以开始通信", .{});
-
-                if (result.connection) |*conn| {
-                    var connection = conn.*;
-
-                    // 发送 Hello 消息
-                    const hello_msg = "Hello";
-                    log.info(">>> 发送消息: {s}", .{hello_msg});
-                    _ = connection.send(hello_msg) catch |e| {
-                        log.err("发送消息失败: {any}", .{e});
-                    };
-
-                    // 接收对方的 Hello 消息
-                    var recv_buf: [256]u8 = undefined;
-                    if (connection.recvWithTimeout(&recv_buf, 2000)) |recv_len| {
-                        if (recv_len > 0) {
-                            log.info("<<< 收到消息: {s}", .{recv_buf[0..recv_len]});
-                        }
-                    } else |_| {}
-
-                    // 注意：不关闭连接，保持隧道可用
-                    log.info("隧道连接已建立，保持活跃状态", .{});
-                }
-            } else {
-                log.err("自动打洞失败，所有方式均未成功", .{});
-            }
-        } else {
-            // 指定方式打洞
-            const transport_type = parseTransportType(transport_str.?);
-            log.info("使用指定方式打洞: {s}", .{transport_type.name()});
-
-            const result = try client.requestPunch(tid, transport_type);
-
-            if (result.success) {
-                log.info("打洞成功! 可以开始通信", .{});
-
-                if (result.connection) |*conn| {
-                    var connection = conn.*;
-
-                    // 发送 Hello 消息
-                    const hello_msg = "Hello";
-                    log.info(">>> 发送消息: {s}", .{hello_msg});
-                    _ = connection.send(hello_msg) catch |e| {
-                        log.err("发送消息失败: {any}", .{e});
-                    };
-
-                    // 接收对方的 Hello 消息
-                    var recv_buf: [256]u8 = undefined;
-                    if (connection.recvWithTimeout(&recv_buf, 2000)) |recv_len| {
-                        if (recv_len > 0) {
-                            log.info("<<< 收到消息: {s}", .{recv_buf[0..recv_len]});
-                        }
-                    } else |_| {}
-
-                    // 注意：不关闭连接，保持隧道可用
-                    log.info("隧道连接已建立，保持活跃状态", .{});
-                }
-            } else {
-                log.err("打洞失败: {s}", .{result.error_message});
-            }
-        }
     } else {
-        // 等待其他节点连接
+        // 进入消息循环，等待服务端协调的打洞请求
         log.info("等待打洞请求...", .{});
-        log.info("提示: 使用 -t <目标ID> 来发起打洞", .{});
+        if (client_config.auto_punch_on_peer_online) {
+            log.info("自动打洞已启用，将在新节点上线时自动发起打洞", .{});
+        }
         try client.runLoop();
     }
 }
@@ -1741,7 +1761,7 @@ fn parseTransportType(str: []const u8) types.TransportType {
 
 fn printUsage() void {
     const usage =
-        \\打洞客户端 (支持配置文件和自动打洞)
+        \\打洞客户端 (支持配置文件和服务端协调打洞)
         \\
         \\用法: client [选项]
         \\
@@ -1750,17 +1770,7 @@ fn printUsage() void {
         \\  -s, --server <地址>   服务器地址 (覆盖配置文件)
         \\  -p, --port <端口>     服务器端口 (覆盖配置文件)
         \\  -n, --name <名称>     本机名称 (覆盖配置文件)
-        \\  -t, --target <ID>     目标节点 ID (发起打洞)
-        \\  -m, --method <方式>   传输方式 (指定单一方式):
-        \\                          udp       - UDP 打洞
-        \\                          udp-p2p   - UDP 同时打开
-        \\                          tcp-p2p   - TCP 同时打开
-        \\                          tcp-ttl   - TCP 低 TTL
-        \\                          udp-map   - UDP 端口映射
-        \\                          tcp-map   - TCP 端口映射
-        \\                          quic      - MsQuic
-        \\  -a, --auto            自动模式 (按配置顺序尝试所有打洞方式)
-        \\  --auto-punch          监听新节点上线并自动打洞
+        \\  --auto-punch          监听新节点上线并自动发起打洞
         \\  -l, --list            列出在线节点
         \\
         \\TLS 选项:
@@ -1776,7 +1786,7 @@ fn printUsage() void {
         \\  可编辑配置文件调整打洞方式的启用状态和优先级
         \\
         \\示例:
-        \\  # 使用默认配置连接服务器并等待连接
+        \\  # 使用默认配置连接服务器并等待连接 (被动方)
         \\  client
         \\
         \\  # 使用指定配置文件
@@ -1785,14 +1795,8 @@ fn printUsage() void {
         \\  # 列出在线节点
         \\  client -l
         \\
-        \\  # 自动模式向指定节点打洞 (按配置优先级尝试)
-        \\  client -t node123 -a
-        \\
-        \\  # 监听新节点上线并自动打洞
+        \\  # 监听新节点上线并自动打洞 (发起方)
         \\  client --auto-punch
-        \\
-        \\  # 向指定节点发起指定方式打洞
-        \\  client -t node123 -m udp
         \\
         \\  # 命令行参数覆盖配置文件
         \\  client -s 192.168.1.100 -p 7891 -n "我的电脑"
