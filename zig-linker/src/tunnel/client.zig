@@ -67,6 +67,8 @@ pub const ClientConfig = struct {
     tls_enabled: bool = true,
     /// 是否跳过服务器证书验证（用于自签名证书）
     tls_skip_verify: bool = false,
+    /// 是否自动与新上线节点打洞
+    auto_punch_on_peer_online: bool = false,
 };
 
 /// 打洞结果
@@ -124,6 +126,12 @@ pub const PunchClient = struct {
 
     /// 打洞回调
     on_punch_request: ?*const fn (*Self, *const protocol.PunchBegin) void = null,
+
+    /// 节点上线回调
+    on_peer_online: ?*const fn (*Self, *const protocol.PeerOnline) void = null,
+
+    /// 节点下线回调
+    on_peer_offline: ?*const fn (*Self, *const protocol.PeerOffline) void = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Self {
         return Self{
@@ -730,6 +738,64 @@ pub const PunchClient = struct {
         }
     }
 
+    /// 发送打洞请求
+    pub fn sendPunchRequest(self: *Self, target_machine_id: []const u8) !void {
+        if (self.server_socket == null) return error.NotConnected;
+
+        // 构建打洞请求 payload
+        var payload_buf: [512]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 目标机器 ID (2 bytes length + data)
+        try writer.writeInt(u16, @intCast(target_machine_id.len), .big);
+        try writer.writeAll(target_machine_id);
+
+        // 传输方式 (1 byte) - 默认使用 UDP
+        try writer.writeByte(@intFromEnum(types.TransportType.udp));
+
+        // 方向 (1 byte) - 正向
+        try writer.writeByte(@intFromEnum(types.TunnelDirection.forward));
+
+        // 事务 ID (16 bytes)
+        const transaction_id = protocol.generateTransactionId();
+        try writer.writeAll(&transaction_id);
+
+        // 流 ID (4 bytes)
+        try writer.writeInt(u32, 0, .big);
+
+        // SSL (1 byte)
+        try writer.writeByte(if (self.config.tls_enabled) 1 else 0);
+
+        const payload = payload_stream.getWritten();
+
+        const header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .punch_request,
+            .data_length = @intCast(payload.len),
+            .sequence = self.nextSequence(),
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try header.serialize(&header_buf);
+
+        // 合并 header 和 payload
+        var send_buf: [768]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(send_buf[0..total_len]);
+        } else {
+            _ = try posix.send(self.server_socket.?, send_buf[0..total_len], 0);
+        }
+
+        log.info("已发送打洞请求，目标: {s}", .{target_machine_id});
+    }
+
     /// 运行消息循环
     pub fn runLoop(self: *Self) !void {
         const sock = self.server_socket orelse return error.NotConnected;
@@ -791,8 +857,60 @@ pub const PunchClient = struct {
                     const loop_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
                     const begin = protocol.PunchBegin.parse(loop_payload) orelse continue;
 
+                    log.info("", .{});
+                    log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+                    log.info("║              收到打洞请求                                     ║", .{});
+                    log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+                    log.info("║ 来自: {s}", .{begin.source_machine_id});
+                    log.info("║ NAT:  {s}", .{begin.source_nat_type.description()});
+                    log.info("║ 方式: {s}", .{begin.transport.description()});
+                    log.info("║ 方向: {s}", .{if (begin.direction == .forward) "正向" else "反向"});
+                    log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+
                     if (self.on_punch_request) |callback| {
                         callback(self, &begin);
+                    }
+                },
+                .peer_online => {
+                    // 收到节点上线通知
+                    const loop_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
+                    const peer_info = protocol.PeerOnline.parse(loop_payload) orelse continue;
+
+                    log.info("", .{});
+                    log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+                    log.info("║              新节点上线                                       ║", .{});
+                    log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+                    log.info("║ ID:   {s}", .{peer_info.machine_id});
+                    log.info("║ 名称: {s}", .{peer_info.machine_name});
+                    log.info("║ NAT:  {s}", .{peer_info.nat_type.description()});
+                    log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+
+                    // 调用回调
+                    if (self.on_peer_online) |callback| {
+                        callback(self, &peer_info);
+                    }
+
+                    // 如果启用了自动打洞，尝试与新节点建立连接
+                    if (self.config.auto_punch_on_peer_online) {
+                        log.info("自动打洞已启用，正在尝试与 {s} 打洞...", .{peer_info.machine_id});
+                        self.sendPunchRequest(peer_info.machine_id) catch |e| {
+                            log.err("发送打洞请求失败: {any}", .{e});
+                        };
+                    }
+                },
+                .peer_offline => {
+                    // 收到节点下线通知
+                    const loop_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
+                    const peer_info = protocol.PeerOffline.parse(loop_payload) orelse continue;
+
+                    log.info("", .{});
+                    log.info("┌──────────────────────────────────────────────────────────────┐", .{});
+                    log.info("│ 节点下线: {s}", .{peer_info.machine_id});
+                    log.info("└──────────────────────────────────────────────────────────────┘", .{});
+
+                    // 调用回调
+                    if (self.on_peer_offline) |callback| {
+                        callback(self, &peer_info);
                     }
                 },
                 else => {
@@ -1042,6 +1160,9 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--auto")) {
             auto_mode = true;
+        } else if (std.mem.eql(u8, arg, "--auto-punch")) {
+            // 自动与新上线节点打洞
+            auto_mode = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
             list_only = true;
         } else if (std.mem.eql(u8, arg, "--tls")) {
@@ -1086,6 +1207,8 @@ pub fn main() !void {
         // skip_verify 是 verify_server 的反向逻辑
         .tls_enabled = cmd_tls_enabled orelse config_manager.config.tls.enabled,
         .tls_skip_verify = cmd_tls_skip_verify orelse !config_manager.config.tls.verify_server,
+        // 自动打洞：命令行 --auto-punch 或配置文件中启用
+        .auto_punch_on_peer_online = auto_mode or config_manager.config.auto_punch_on_peer_online,
     };
 
     log.info("", .{});
@@ -1220,6 +1343,7 @@ fn printUsage() void {
         \\                          tcp-map   - TCP 端口映射
         \\                          quic      - MsQuic
         \\  -a, --auto            自动模式 (按配置顺序尝试所有打洞方式)
+        \\  --auto-punch          监听新节点上线并自动打洞
         \\  -l, --list            列出在线节点
         \\
         \\TLS 选项:
@@ -1246,6 +1370,9 @@ fn printUsage() void {
         \\
         \\  # 自动模式向指定节点打洞 (按配置优先级尝试)
         \\  client -t node123 -a
+        \\
+        \\  # 监听新节点上线并自动打洞
+        \\  client --auto-punch
         \\
         \\  # 向指定节点发起指定方式打洞
         \\  client -t node123 -m udp

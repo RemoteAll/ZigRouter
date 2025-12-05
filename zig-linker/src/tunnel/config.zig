@@ -69,6 +69,9 @@ pub const ClientConfiguration = struct {
     /// 端口映射端口（0 表示不使用）
     port_map_wan: u16 = 0,
 
+    /// 是否自动与新上线节点打洞
+    auto_punch_on_peer_online: bool = false,
+
     /// 日志级别: debug, info, warn, error
     log_level: []const u8 = "info",
     /// 是否启用彩色日志

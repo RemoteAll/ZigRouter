@@ -399,10 +399,16 @@ pub const PunchServer = struct {
         // 发送注册成功响应（使用新注册的客户端信息）
         try self.sendRegisterResponseToClient(&client_info);
 
+        // 广播新客户端上线通知给其他客户端
+        self.broadcastPeerOnline(&client_info);
+
         // 进入消息处理循环
         self.handleClientMessagesWithTls(client_info.machine_id) catch |e| {
             log.err("客户端消息处理错误: {any}", .{e});
         };
+
+        // 广播客户端下线通知
+        self.broadcastPeerOffline(client_info.machine_id);
 
         // 客户端断开，清理
         log.info("客户端断开: {s}", .{client_info.machine_id});
@@ -578,9 +584,23 @@ pub const PunchServer = struct {
             log.warn("  目标方 NAT: {s}", .{target_client.nat_type.description()});
         }
 
-        // 发送打洞成功响应
+        // 向目标客户端发送打洞开始通知
+        self.sendPunchBeginToClient(&target_client, from_client, &request) catch |e| {
+            log.err("向目标客户端发送打洞通知失败: {any}", .{e});
+            try self.sendPunchResponseToClient(from_client, false, .unknown, null);
+            self.stats.failed_punches += 1;
+            return;
+        };
+
+        // 向发起方也发送打洞开始通知（包含目标信息）
+        self.sendPunchBeginToInitiator(from_client, &target_client, &request) catch |e| {
+            log.err("向发起方发送打洞通知失败: {any}", .{e});
+        };
+
+        // 发送打洞成功响应给发起方
         try self.sendPunchResponseToClient(from_client, true, .success, null);
 
+        self.stats.successful_punches += 1;
         log.info("已通知双方开始打洞", .{});
     }
 
@@ -618,6 +638,239 @@ pub const PunchServer = struct {
         const total_len = protocol.MessageHeader.SIZE + payload.len;
 
         try client.sendData(send_buf[0..total_len]);
+    }
+
+    /// 向目标客户端发送打洞开始通知
+    fn sendPunchBeginToClient(self: *Self, target: *const ClientInfo, initiator: *const ClientInfo, request: *const protocol.PunchRequest) !void {
+        _ = self;
+        var payload_buf: [512]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 源机器 ID
+        try writer.writeInt(u16, @intCast(initiator.machine_id.len), .big);
+        try writer.writeAll(initiator.machine_id);
+
+        // 源 NAT 类型
+        try writer.writeByte(@intFromEnum(initiator.nat_type));
+
+        // 传输方式
+        try writer.writeByte(@intFromEnum(request.transport));
+
+        // 方向 (对于目标客户端是反向)
+        try writer.writeByte(@intFromEnum(types.TunnelDirection.reverse));
+
+        // 事务 ID
+        try writer.writeAll(&request.transaction_id);
+
+        // 流 ID
+        try writer.writeInt(u32, request.flow_id, .big);
+
+        // SSL
+        try writer.writeByte(if (request.ssl) 1 else 0);
+
+        // 发起方公网地址 - 格式化为字符串
+        var public_addr_buf: [64]u8 = undefined;
+        const public_addr = if (initiator.public_addr) |addr|
+            std.fmt.bufPrint(&public_addr_buf, "{any}", .{addr}) catch "unknown"
+        else
+            std.fmt.bufPrint(&public_addr_buf, "{any}", .{initiator.local_addr}) catch "unknown";
+        try writer.writeInt(u16, @intCast(public_addr.len), .big);
+        try writer.writeAll(public_addr);
+
+        // 发起方本地地址
+        var local_addr_buf: [64]u8 = undefined;
+        const local_addr = std.fmt.bufPrint(&local_addr_buf, "{any}", .{initiator.local_addr}) catch "unknown";
+        try writer.writeInt(u16, @intCast(local_addr.len), .big);
+        try writer.writeAll(local_addr);
+
+        const payload = payload_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .punch_begin,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        var send_buf: [768]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        try target.sendData(send_buf[0..total_len]);
+
+        log.info("已向目标 {s} 发送打洞开始通知，发起方: {s}", .{ target.machine_id, initiator.machine_id });
+    }
+
+    /// 向发起方发送打洞开始通知（包含目标信息）
+    fn sendPunchBeginToInitiator(self: *Self, initiator: *const ClientInfo, target: *const ClientInfo, request: *const protocol.PunchRequest) !void {
+        _ = self;
+        var payload_buf: [512]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 目标机器 ID
+        try writer.writeInt(u16, @intCast(target.machine_id.len), .big);
+        try writer.writeAll(target.machine_id);
+
+        // 目标 NAT 类型
+        try writer.writeByte(@intFromEnum(target.nat_type));
+
+        // 传输方式
+        try writer.writeByte(@intFromEnum(request.transport));
+
+        // 方向 (发起方是正向)
+        try writer.writeByte(@intFromEnum(request.direction));
+
+        // 事务 ID
+        try writer.writeAll(&request.transaction_id);
+
+        // 流 ID
+        try writer.writeInt(u32, request.flow_id, .big);
+
+        // SSL
+        try writer.writeByte(if (request.ssl) 1 else 0);
+
+        // 目标公网地址
+        var public_addr_buf: [64]u8 = undefined;
+        const public_addr = if (target.public_addr) |addr|
+            std.fmt.bufPrint(&public_addr_buf, "{any}", .{addr}) catch "unknown"
+        else
+            std.fmt.bufPrint(&public_addr_buf, "{any}", .{target.local_addr}) catch "unknown";
+        try writer.writeInt(u16, @intCast(public_addr.len), .big);
+        try writer.writeAll(public_addr);
+
+        // 目标本地地址
+        var local_addr_buf: [64]u8 = undefined;
+        const local_addr = std.fmt.bufPrint(&local_addr_buf, "{any}", .{target.local_addr}) catch "unknown";
+        try writer.writeInt(u16, @intCast(local_addr.len), .big);
+        try writer.writeAll(local_addr);
+
+        const payload = payload_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .punch_begin,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        var send_buf: [768]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        try initiator.sendData(send_buf[0..total_len]);
+
+        log.info("已向发起方 {s} 发送打洞开始通知，目标: {s}", .{ initiator.machine_id, target.machine_id });
+    }
+
+    /// 广播新客户端上线通知给其他在线客户端
+    fn broadcastPeerOnline(self: *Self, new_client: *const ClientInfo) void {
+        // 构建通知消息
+        var payload_buf: [512]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 写入新客户端信息
+        writer.writeInt(u16, @intCast(new_client.machine_id.len), .big) catch return;
+        writer.writeAll(new_client.machine_id) catch return;
+        writer.writeInt(u16, @intCast(new_client.machine_name.len), .big) catch return;
+        writer.writeAll(new_client.machine_name) catch return;
+        writer.writeByte(@intFromEnum(new_client.nat_type)) catch return;
+
+        const payload = payload_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .peer_online,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        msg_header.serialize(&header_buf) catch return;
+
+        // 合并 header 和 payload
+        var send_buf: [768]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 广播给所有其他客户端
+        self.clients_mutex.lock();
+        defer self.clients_mutex.unlock();
+
+        var iter = self.clients.iterator();
+        while (iter.next()) |entry| {
+            // 跳过新注册的客户端自己
+            if (std.mem.eql(u8, entry.key_ptr.*, new_client.machine_id)) continue;
+
+            const client = entry.value_ptr;
+            client.sendData(send_buf[0..total_len]) catch |e| {
+                log.debug("发送上线通知给 {s} 失败: {any}", .{ client.machine_id, e });
+            };
+        }
+
+        log.info("已广播节点上线通知: {s}", .{new_client.machine_id});
+    }
+
+    /// 广播客户端下线通知给其他在线客户端
+    fn broadcastPeerOffline(self: *Self, machine_id: []const u8) void {
+        // 构建通知消息
+        var payload_buf: [256]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 写入下线客户端 ID
+        writer.writeInt(u16, @intCast(machine_id.len), .big) catch return;
+        writer.writeAll(machine_id) catch return;
+
+        const payload = payload_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .peer_offline,
+            .data_length = @intCast(payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        msg_header.serialize(&header_buf) catch return;
+
+        // 合并 header 和 payload
+        var send_buf: [512]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 广播给所有其他客户端
+        self.clients_mutex.lock();
+        defer self.clients_mutex.unlock();
+
+        var iter = self.clients.iterator();
+        while (iter.next()) |entry| {
+            // 跳过下线的客户端自己
+            if (std.mem.eql(u8, entry.key_ptr.*, machine_id)) continue;
+
+            const client = entry.value_ptr;
+            client.sendData(send_buf[0..total_len]) catch |e| {
+                log.debug("发送下线通知给 {s} 失败: {any}", .{ client.machine_id, e });
+            };
+        }
+
+        log.info("已广播节点下线通知: {s}", .{machine_id});
     }
 
     /// 发送在线客户端列表（使用 TLS）

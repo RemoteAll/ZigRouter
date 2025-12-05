@@ -40,6 +40,10 @@ pub const MessageType = enum(u8) {
     list_peers = 0x22,
     /// 列出在线客户端响应
     list_peers_response = 0x23,
+    /// 节点上线通知
+    peer_online = 0x24,
+    /// 节点下线通知
+    peer_offline = 0x25,
     /// NAT 信息
     nat_info = 0x30,
     /// 错误响应
@@ -58,6 +62,10 @@ pub const MessageType = enum(u8) {
             .punch_fail => "打洞失败",
             .query_peer => "查询节点",
             .query_response => "查询响应",
+            .list_peers => "列出节点",
+            .list_peers_response => "节点列表",
+            .peer_online => "节点上线",
+            .peer_offline => "节点下线",
             .nat_info => "NAT信息",
             .error_response => "错误响应",
             _ => "未知消息",
@@ -313,15 +321,17 @@ pub const PunchRequest = struct {
     }
 
     /// 从缓冲区解析
+    /// 数据格式: id_len(2) + target_id(变长) + transport(1) + direction(1) + transaction_id(16) + flow_id(4) + ssl(1)
+    /// 最小长度: 2 + 1 + 23 = 26 字节（假设 id_len >= 1）
     pub fn parse(data: []const u8) ?PunchRequest {
-        if (data.len < 26) return null; // 最小长度
+        if (data.len < 25) return null; // 最小长度: 2 + 0 + 23 = 25
 
         var stream = std.io.fixedBufferStream(data);
         const reader = stream.reader();
 
         // 目标机器 ID
         const id_len = reader.readInt(u16, .big) catch return null;
-        if (data.len < 2 + id_len + 24) return null;
+        if (data.len < 2 + id_len + 23) return null; // transport(1) + direction(1) + transaction_id(16) + flow_id(4) + ssl(1) = 23
         const target_id_end = 2 + id_len;
         const target_machine_id = data[2..target_id_end];
 
@@ -491,6 +501,67 @@ var global_sequence: u32 = 0;
 pub fn nextSequence() u32 {
     return @atomicRmw(u32, &global_sequence, .Add, 1, .seq_cst);
 }
+
+/// 节点上线通知
+pub const PeerOnline = struct {
+    /// 机器 ID
+    machine_id: []const u8,
+    /// 机器名称
+    machine_name: []const u8,
+    /// NAT 类型
+    nat_type: types.NatType,
+
+    /// 解析节点上线通知
+    pub fn parse(data: []const u8) ?PeerOnline {
+        if (data.len < 5) return null;
+
+        var offset: usize = 0;
+
+        // 机器 ID 长度 (2 bytes)
+        const id_len = std.mem.readInt(u16, data[0..2], .big);
+        offset += 2;
+        if (data.len < offset + id_len + 3) return null;
+
+        const machine_id = data[offset .. offset + id_len];
+        offset += id_len;
+
+        // 机器名称长度 (2 bytes)
+        const name_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
+        offset += 2;
+        if (data.len < offset + name_len + 1) return null;
+
+        const machine_name = data[offset .. offset + name_len];
+        offset += name_len;
+
+        // NAT 类型 (1 byte)
+        const nat_type: types.NatType = @enumFromInt(data[offset]);
+
+        return PeerOnline{
+            .machine_id = machine_id,
+            .machine_name = machine_name,
+            .nat_type = nat_type,
+        };
+    }
+};
+
+/// 节点下线通知
+pub const PeerOffline = struct {
+    /// 机器 ID
+    machine_id: []const u8,
+
+    /// 解析节点下线通知
+    pub fn parse(data: []const u8) ?PeerOffline {
+        if (data.len < 2) return null;
+
+        // 机器 ID 长度 (2 bytes)
+        const id_len = std.mem.readInt(u16, data[0..2], .big);
+        if (data.len < 2 + id_len) return null;
+
+        return PeerOffline{
+            .machine_id = data[2 .. 2 + id_len],
+        };
+    }
+};
 
 test "MessageHeader serialize and parse" {
     const header = MessageHeader{
