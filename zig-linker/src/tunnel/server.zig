@@ -10,7 +10,6 @@ const types = @import("types.zig");
 const log = @import("log.zig");
 const net_utils = @import("net_utils.zig");
 const protocol = @import("protocol.zig");
-const stun = @import("stun.zig");
 const tls = @import("tls.zig");
 
 /// 客户端信息
@@ -87,7 +86,7 @@ pub const ClientInfo = struct {
 /// 打洞服务器配置
 pub const ServerConfig = struct {
     /// 监听端口
-    listen_port: u16 = 7891,
+    listen_port: u16 = 18021,
     /// 监听地址
     listen_addr: []const u8 = "0.0.0.0",
     /// 最大客户端数
@@ -111,8 +110,11 @@ pub const PunchServer = struct {
     allocator: std.mem.Allocator,
     config: ServerConfig,
 
-    /// 监听 socket
+    /// TCP 监听 socket
     listen_socket: ?posix.socket_t = null,
+
+    /// UDP 监听 socket (用于公网地址探测)
+    udp_socket: ?posix.socket_t = null,
 
     /// 已连接的客户端
     clients: std.StringHashMap(ClientInfo),
@@ -182,9 +184,27 @@ pub const PunchServer = struct {
         try posix.listen(sock, 128);
 
         self.listen_socket = sock;
+
+        // 创建 UDP socket (用于公网地址探测，类似 STUN)
+        const udp_sock = try posix.socket(
+            posix.AF.INET,
+            posix.SOCK.DGRAM,
+            posix.IPPROTO.UDP,
+        );
+        errdefer posix.close(udp_sock);
+
+        // 设置 UDP socket 选项
+        try net_utils.setReuseAddr(udp_sock, true);
+
+        // 绑定 UDP 到同一端口
+        try posix.bind(udp_sock, &listen_addr.any, listen_addr.getOsSockLen());
+
+        self.udp_socket = udp_sock;
         self.running = true;
 
         log.info("服务器已启动，监听地址: {s}:{d}", .{ self.config.listen_addr, self.config.listen_port });
+        log.info("TCP 信令通道: 已启用", .{});
+        log.info("UDP 地址探测: 已启用 (端口 {d})", .{self.config.listen_port});
         log.info("等待客户端连接...", .{});
     }
 
@@ -218,6 +238,12 @@ pub const PunchServer = struct {
             self.listen_socket = null;
         }
 
+        // 关闭 UDP socket
+        if (self.udp_socket) |sock| {
+            posix.close(sock);
+            self.udp_socket = null;
+        }
+
         self.running = false;
         log.info("服务器已停止", .{});
     }
@@ -229,6 +255,15 @@ pub const PunchServer = struct {
         }
 
         const listen_sock = self.listen_socket orelse return;
+
+        // 启动 UDP 处理线程
+        if (self.udp_socket) |udp_sock| {
+            const udp_thread = std.Thread.spawn(.{}, handleUdpThread, .{ self, udp_sock }) catch |e| {
+                log.err("创建 UDP 处理线程失败: {any}", .{e});
+                return e;
+            };
+            udp_thread.detach();
+        }
 
         while (self.running) {
             // 等待新连接
@@ -255,6 +290,113 @@ pub const PunchServer = struct {
             };
             thread.detach();
         }
+    }
+
+    /// UDP 处理线程函数
+    /// 用于公网地址探测（类似 STUN，但使用自定义协议）
+    fn handleUdpThread(self: *Self, udp_sock: posix.socket_t) void {
+        log.info("UDP 地址探测服务已启动", .{});
+
+        var buf: [1024]u8 = undefined;
+        var src_addr: posix.sockaddr = undefined;
+        var src_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+
+        while (self.running) {
+            // 接收 UDP 数据
+            const recv_result = posix.recvfrom(udp_sock, &buf, 0, &src_addr, &src_len);
+            const recv_len = recv_result catch |e| {
+                if (e == error.WouldBlock) {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                }
+                log.err("UDP 接收错误: {any}", .{e});
+                continue;
+            };
+
+            if (recv_len == 0) {
+                continue;
+            }
+
+            // 检查消息类型（第一个字节为 0 表示地址探测请求）
+            if (buf[0] != 0) {
+                continue;
+            }
+
+            const client_ep = net.Address{ .any = src_addr };
+
+            // 记录调试信息
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = ClientInfo.formatAddress(client_ep, &addr_buf);
+            log.debug("收到 UDP 地址探测请求: {s}", .{addr_str});
+
+            // 构建响应：返回客户端的公网地址
+            var response: [128]u8 = undefined;
+            const resp_len = self.buildExternalAddrResponse(&response, client_ep);
+
+            // 发送响应
+            _ = posix.sendto(udp_sock, response[0..resp_len], 0, &src_addr, src_len) catch |e| {
+                log.err("UDP 发送响应错误: {any}", .{e});
+                continue;
+            };
+
+            log.debug("已发送公网地址响应: {s}", .{addr_str});
+        }
+
+        log.info("UDP 地址探测服务已停止", .{});
+    }
+
+    /// 构建公网地址响应
+    /// 格式: [AddressFamily(1)] [IP(4或16)] [Port(2)] [随机填充]
+    /// 所有字节与 0xFF 异或以防止网关修改
+    fn buildExternalAddrResponse(self: *Self, buffer: []u8, client_ep: net.Address) usize {
+        _ = self;
+
+        var offset: usize = 0;
+
+        // AddressFamily (直接使用数值)
+        buffer[offset] = @truncate(client_ep.any.family);
+        offset += 1;
+
+        // IP 地址
+        const ip_len: usize = switch (client_ep.any.family) {
+            posix.AF.INET => blk: {
+                const addr_bytes = @as(*const [4]u8, @ptrCast(&client_ep.in.sa.addr));
+                @memcpy(buffer[offset .. offset + 4], addr_bytes);
+                break :blk 4;
+            },
+            posix.AF.INET6 => blk: {
+                @memcpy(buffer[offset .. offset + 16], &client_ep.in6.sa.addr);
+                break :blk 16;
+            },
+            else => 0,
+        };
+        offset += ip_len;
+
+        // Port (大端序)
+        const port = switch (client_ep.any.family) {
+            posix.AF.INET => client_ep.in.sa.port,
+            posix.AF.INET6 => client_ep.in6.sa.port,
+            else => 0,
+        };
+        buffer[offset] = @truncate(port >> 8);
+        buffer[offset + 1] = @truncate(port & 0xFF);
+        offset += 2;
+
+        // 对前面的字节进行异或（防止网关修改）
+        for (0..offset) |i| {
+            buffer[i] = buffer[i] ^ 0xFF;
+        }
+
+        // 添加随机填充（16-32 字节）
+        var rng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp()));
+        const random = rng.random();
+        const padding_len = random.intRangeAtMost(usize, 16, 32);
+        for (0..padding_len) |i| {
+            buffer[offset + i] = random.int(u8);
+        }
+        offset += padding_len;
+
+        return offset;
     }
 
     /// 客户端处理线程函数
@@ -1307,7 +1449,7 @@ pub fn main() !void {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
-                config.listen_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 7891;
+                config.listen_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 18021;
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "--tls")) {
@@ -1348,7 +1490,7 @@ fn printUsage() void {
         \\用法: punch_server [选项]
         \\
         \\选项:
-        \\  -p, --port <端口>     监听端口 (默认: 7891)
+        \\  -p, --port <端口>     监听端口 (默认: 18021)
         \\
         \\TLS 选项:
         \\  --tls                 强制启用 TLS 加密 (默认已启用)
@@ -1381,7 +1523,7 @@ fn printUsage() void {
 
 test "ServerConfig defaults" {
     const config = ServerConfig{};
-    try std.testing.expectEqual(@as(u16, 7891), config.listen_port);
+    try std.testing.expectEqual(@as(u16, 18021), config.listen_port);
     try std.testing.expectEqual(@as(usize, 1024), config.max_clients);
 }
 

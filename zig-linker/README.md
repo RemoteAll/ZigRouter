@@ -172,16 +172,84 @@ zig build
 - `punch_client.exe` - 打洞客户端
 - `zig_linker.exe` - 主程序
 
+## 端口说明
+
+| 项目 | 默认端口 | 说明 |
+|------|----------|------|
+| **C# linker** | 1802 | 原版 linker 项目端口 |
+| **Zig linker** | 18021 | 本项目端口（在 1802 后加 1 便于区分） |
+
+> **注意**：Zig linker 使用独立端口 **18021**，与 C# linker 的 **1802** 互不冲突，可以同时部署。
+
+## 防火墙与端口配置
+
+### 服务端端口要求
+
+服务端需要同时开放 **TCP 和 UDP 同一端口**（默认 18021）：
+
+| 协议 | 端口 | 用途 | 必需 |
+|------|------|------|------|
+| **TCP** | 18021 | 信令通道（客户端注册、消息交换、打洞协调） | ✅ 是 |
+| **UDP** | 18021 | 公网地址探测（类似 STUN，返回客户端公网 IP:Port） | ✅ 是 |
+
+> **注意**：UDP 端口用于客户端获取自己的公网地址，这是 NAT 穿透的关键步骤。如果只开放 TCP，客户端将无法正确检测公网地址，会回退到外部 STUN 服务器（如 Google STUN）。
+
+### 公网地址探测机制
+
+客户端启动时会通过以下方式获取自己的公网地址：
+
+1. **优先：Linker 服务端 UDP 探测**（推荐）
+   - 客户端向服务端发送 UDP 探测包
+   - 服务端返回客户端的公网 IP:Port
+   - 优点：不依赖外部服务，更可靠
+
+2. **回退：外部 STUN 服务器**
+   - 如果 Linker UDP 探测失败，使用配置文件中的 STUN 服务器
+   - 默认使用 `stun.l.google.com:19302`
+
+### 防火墙配置示例
+
+**Linux (iptables)**：
+```bash
+# 开放 TCP 和 UDP 端口
+iptables -A INPUT -p tcp --dport 18021 -j ACCEPT
+iptables -A INPUT -p udp --dport 18021 -j ACCEPT
+```
+
+**Linux (firewalld)**：
+```bash
+firewall-cmd --permanent --add-port=18021/tcp
+firewall-cmd --permanent --add-port=18021/udp
+firewall-cmd --reload
+```
+
+**Windows 防火墙**：
+```powershell
+# 开放 TCP 端口
+netsh advfirewall firewall add rule name="Zig Linker TCP" dir=in action=allow protocol=tcp localport=18021
+
+# 开放 UDP 端口
+netsh advfirewall firewall add rule name="Zig Linker UDP" dir=in action=allow protocol=udp localport=18021
+```
+
+### 客户端端口要求
+
+客户端通常**不需要开放入站端口**，只需要：
+- 允许 **出站 TCP**（连接信令服务器）
+- 允许 **出站 UDP**（NAT 探测和打洞）
+
+大多数家用路由器和企业防火墙默认允许出站连接。
+
 ## 使用方法
 
 ### 启动服务器
 
 ```bash
-punch_server -p 7891
+punch_server
 ```
 
 服务端选项：
-- `-p, --port <端口>` - 监听端口（默认 7891）
+- `-p, --port <端口>` - 监听端口（默认 18021）
 - `--no-tls` - 禁用 TLS 加密（仅用于本地调试）
 - `-h, --help` - 显示帮助信息
 

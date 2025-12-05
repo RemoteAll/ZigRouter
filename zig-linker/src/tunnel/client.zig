@@ -10,7 +10,6 @@ const types = @import("types.zig");
 const log = @import("log.zig");
 const net_utils = @import("net_utils.zig");
 const protocol = @import("protocol.zig");
-const stun = @import("stun.zig");
 const transport_mod = @import("transport.zig");
 const config_mod = @import("config.zig");
 const tls = @import("tls.zig");
@@ -60,7 +59,7 @@ pub const ClientConfig = struct {
     /// 服务器地址
     server_addr: []const u8 = "127.0.0.1",
     /// 服务器端口
-    server_port: u16 = 7891,
+    server_port: u16 = 18021,
     /// 本机 ID
     machine_id: []const u8 = "",
     /// 本机名称
@@ -69,10 +68,6 @@ pub const ClientConfig = struct {
     heartbeat_interval: u32 = 30,
     /// 端口映射端口 (0 表示不使用)
     port_map_wan: u16 = 0,
-    /// STUN 服务器 (用于 NAT 检测)
-    stun_server: []const u8 = "stun.l.google.com",
-    /// STUN 端口
-    stun_port: u16 = 19302,
     /// 自动检测 NAT 类型
     auto_detect_nat: bool = true,
     /// 是否启用 TLS 加密
@@ -250,36 +245,120 @@ pub const PunchClient = struct {
         self.registered = false;
     }
 
-    /// 检测 NAT 类型
+    /// 检测 NAT 类型（通过 Linker 服务端 UDP 探测）
     fn detectNatType(self: *Self) !void {
         log.info("正在检测 NAT 类型...", .{});
 
-        // 解析 STUN 服务器地址
-        const server_addr = net.Address.parseIp4(self.config.stun_server, self.config.stun_port) catch {
-            log.warn("无法解析 STUN 服务器地址，使用默认 NAT 类型", .{});
-            self.local_nat_type = .unknown;
+        // 使用 Linker 服务端的 UDP 探测（与 C# linker 一致，不依赖外部 STUN 服务）
+        if (self.getExternalAddrFromLinker()) |result| {
+            self.local_nat_type = result.nat_type;
+            self.public_addr = result.public_addr;
+            log.info("通过 Linker 服务端获取公网地址成功", .{});
+            log.logNatDetection(
+                result.nat_type,
+                self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                result.public_addr,
+            );
             return;
-        };
-
-        const local_addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
-
-        var stun_client = stun.StunClient.init(server_addr, local_addr, .{});
-        defer stun_client.deinit();
-
-        const result = stun_client.query() catch |e| {
-            log.warn("NAT 检测失败: {any}，使用默认值", .{e});
+        } else |e| {
+            log.warn("Linker UDP 探测失败: {any}，使用默认 NAT 类型", .{e});
             self.local_nat_type = .unknown;
-            return;
-        };
+        }
+    }
 
-        self.local_nat_type = result.nat_type;
-        self.public_addr = result.public_endpoint;
+    /// 通过 Linker 服务端 UDP 获取公网地址
+    /// 返回公网地址和 NAT 类型
+    const LinkerExternalResult = struct {
+        public_addr: ?net.Address,
+        nat_type: types.NatType,
+    };
 
-        log.logNatDetection(
-            result.nat_type,
-            result.local_endpoint orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
-            result.public_endpoint,
+    fn getExternalAddrFromLinker(self: *Self) !LinkerExternalResult {
+        // 创建 UDP socket
+        const udp_sock = try posix.socket(
+            posix.AF.INET,
+            posix.SOCK.DGRAM,
+            posix.IPPROTO.UDP,
         );
+        defer posix.close(udp_sock);
+
+        // 设置超时
+        const timeout = posix.timeval{
+            .sec = 2,
+            .usec = 0,
+        };
+        try posix.setsockopt(udp_sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+
+        // 绑定本地地址
+        const local_bind = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+        try posix.bind(udp_sock, &local_bind.any, local_bind.getOsSockLen());
+
+        // 服务器地址
+        const server_addr = try net.Address.parseIp4(self.config.server_addr, self.config.server_port);
+
+        // 构建探测请求：[0x00][序号][随机数据]
+        var request: [64]u8 = undefined;
+        request[0] = 0; // 消息类型：公网地址探测
+        request[1] = 0; // 序号
+
+        // 填充随机数据
+        var rng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp()));
+        const random = rng.random();
+        for (2..request.len) |i| {
+            request[i] = random.int(u8);
+        }
+
+        // 发送请求
+        _ = try posix.sendto(udp_sock, &request, 0, &server_addr.any, server_addr.getOsSockLen());
+
+        // 接收响应
+        var response: [128]u8 = undefined;
+        var src_addr: posix.sockaddr = undefined;
+        var src_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+
+        const recv_len = posix.recvfrom(udp_sock, &response, 0, &src_addr, &src_len) catch |e| {
+            return e;
+        };
+
+        if (recv_len < 7) {
+            return error.InvalidResponse;
+        }
+
+        // 解析响应（数据已与 0xFF 异或）
+        for (0..recv_len) |i| {
+            response[i] = response[i] ^ 0xFF;
+        }
+
+        // 解析地址族
+        const family: u16 = response[0];
+        var public_addr: net.Address = undefined;
+
+        if (family == posix.AF.INET) {
+            // IPv4: [family(1)][ip(4)][port(2)]
+            const ip_bytes = response[1..5];
+            const port_bytes = response[5..7];
+            const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
+
+            public_addr = net.Address.initIp4(ip_bytes[0..4].*, port);
+        } else if (family == posix.AF.INET6) {
+            // IPv6: [family(1)][ip(16)][port(2)]
+            if (recv_len < 19) {
+                return error.InvalidResponse;
+            }
+            const port_bytes = response[17..19];
+            const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
+
+            public_addr = net.Address.initIp6(response[1..17].*, port, 0, 0);
+        } else {
+            return error.UnsupportedAddressFamily;
+        }
+
+        // 简单判断 NAT 类型（后续可以通过多次探测细化）
+        // 如果能收到响应，至少说明 NAT 是可穿透的
+        return LinkerExternalResult{
+            .public_addr = public_addr,
+            .nat_type = .unknown, // 需要更多探测才能确定具体类型
+        };
     }
 
     /// 注册到服务器
@@ -371,7 +450,8 @@ pub const PunchClient = struct {
         log.info("  分配 ID: {s}", .{self.assigned_id});
         log.info("  NAT 类型: {s}", .{self.local_nat_type.description()});
         if (self.public_addr) |pub_addr| {
-            log.info("  公网地址: {any}", .{pub_addr});
+            const addr_str = log.formatAddress(pub_addr);
+            log.info("  公网地址: {s}", .{std.mem.sliceTo(&addr_str, 0)});
         }
         log.info("========================================", .{});
     }
@@ -672,10 +752,11 @@ pub const PunchClient = struct {
         const duration = @as(u64, @intCast(std.time.milliTimestamp() - start_time));
 
         if (connection) |conn| {
+            const remote_addr_str = log.formatAddress(conn.info.remote_endpoint);
             log.info("========================================", .{});
             log.info("  打洞成功!", .{});
             log.info("  耗时: {d} ms", .{duration});
-            log.info("  远程端点: {any}", .{conn.info.remote_endpoint});
+            log.info("  远程端点: {s}", .{std.mem.sliceTo(&remote_addr_str, 0)});
             log.info("========================================", .{});
 
             return PunchResult{
@@ -1025,10 +1106,11 @@ pub const PunchClient = struct {
                     const duration = @as(u64, @intCast(std.time.milliTimestamp() - start_time));
 
                     if (connection) |conn| {
+                        const remote_addr_str = log.formatAddress(conn.info.remote_endpoint);
                         log.info("========== 被动打洞成功 ==========", .{});
                         log.info("传输方式: {s}", .{begin.transport.description()});
                         log.info("耗时: {d} ms", .{duration});
-                        log.info("远程端点: {any}", .{conn.info.remote_endpoint});
+                        log.info("远程端点: {s}", .{std.mem.sliceTo(&remote_addr_str, 0)});
                         log.info("==================================", .{});
 
                         var mutable_conn = conn;
@@ -1617,7 +1699,7 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
-                cmd_server_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 7891;
+                cmd_server_port = std.fmt.parseInt(u16, args[i + 1], 10) catch 18021;
                 i += 1;
             }
         } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--name")) {
@@ -1662,8 +1744,6 @@ pub fn main() !void {
         .machine_id = config_manager.config.machine_id,
         .heartbeat_interval = config_manager.config.heartbeat_interval,
         .port_map_wan = config_manager.config.port_map_wan,
-        .stun_server = config_manager.config.stun_server,
-        .stun_port = config_manager.config.stun_port,
         .auto_detect_nat = config_manager.config.auto_detect_nat,
         // TLS 配置：命令行参数优先于配置文件
         // skip_verify 是 verify_server 的反向逻辑
@@ -1777,7 +1857,7 @@ fn printUsage() void {
 
 test "ClientConfig defaults" {
     const config = ClientConfig{};
-    try std.testing.expectEqual(@as(u16, 7891), config.server_port);
+    try std.testing.expectEqual(@as(u16, 18021), config.server_port);
     try std.testing.expect(config.auto_detect_nat);
 }
 

@@ -207,9 +207,11 @@ pub fn logPunchFailed(transport: types.TransportType, reason: []const u8) void {
 pub fn logNatDetection(nat_type: types.NatType, local_addr: std.net.Address, public_addr: ?std.net.Address) void {
     info("========= NAT 检测结果 =========", .{});
     info("NAT 类型: {s}", .{nat_type.description()});
-    info("本地地址: {any}", .{local_addr});
+    const local_str = formatAddress(local_addr);
+    info("本地地址: {s}", .{std.mem.sliceTo(&local_str, 0)});
     if (public_addr) |addr| {
-        info("公网地址: {any}", .{addr});
+        const pub_str = formatAddress(addr);
+        info("公网地址: {s}", .{std.mem.sliceTo(&pub_str, 0)});
     } else {
         info("公网地址: (未检测到)", .{});
     }
@@ -218,17 +220,20 @@ pub fn logNatDetection(nat_type: types.NatType, local_addr: std.net.Address, pub
 
 /// 记录发送 TTL 包
 pub fn logSendTtl(target: std.net.Address, ttl: u8) void {
-    debug("发送 TTL 包 -> {any}, TTL={d}", .{ target, ttl });
+    const addr_str = formatAddress(target);
+    debug("发送 TTL 包 -> {s}, TTL={d}", .{ std.mem.sliceTo(&addr_str, 0), ttl });
 }
 
 /// 记录收到认证包
 pub fn logRecvAuth(from: std.net.Address) void {
-    debug("收到认证包 <- {any}", .{from});
+    const addr_str = formatAddress(from);
+    debug("收到认证包 <- {s}", .{std.mem.sliceTo(&addr_str, 0)});
 }
 
 /// 记录连接尝试
 pub fn logConnectAttempt(target: std.net.Address, attempt: u32) void {
-    debug("尝试连接 -> {any} (第 {d} 次)", .{ target, attempt });
+    const addr_str = formatAddress(target);
+    debug("尝试连接 -> {s} (第 {d} 次)", .{ std.mem.sliceTo(&addr_str, 0), attempt });
 }
 
 test "log functions" {

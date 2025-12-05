@@ -43,7 +43,7 @@ pub const ClientConfiguration = struct {
     /// 服务器地址
     server_addr: []const u8 = "127.0.0.1",
     /// 服务器端口
-    server_port: u16 = 7891,
+    server_port: u16 = 18021,
 
     /// 本机名称
     machine_name: []const u8 = "",
@@ -61,10 +61,6 @@ pub const ClientConfiguration = struct {
 
     /// 是否自动检测 NAT 类型
     auto_detect_nat: bool = true,
-    /// STUN 服务器地址
-    stun_server: []const u8 = "stun.l.google.com",
-    /// STUN 服务器端口
-    stun_port: u16 = 19302,
 
     /// 端口映射端口（0 表示不使用）
     port_map_wan: u16 = 0,
@@ -224,9 +220,6 @@ pub const ConfigManager = struct {
         if (self.config.machine_id.len > 0 and !isStaticString(self.config.machine_id)) {
             self.allocator.free(self.config.machine_id);
         }
-        if (self.config.stun_server.len > 0 and !isStaticString(self.config.stun_server)) {
-            self.allocator.free(self.config.stun_server);
-        }
         if (self.config.log_level.len > 0 and !isStaticString(self.config.log_level)) {
             self.allocator.free(self.config.log_level);
         }
@@ -249,7 +242,6 @@ pub const ConfigManager = struct {
         const defaults = [_][]const u8{
             "127.0.0.1",
             "",
-            "stun.l.google.com",
             "info",
             "UdpPortMap",
             "TcpPortMap",
@@ -331,8 +323,6 @@ pub const ConfigManager = struct {
         try writer.writeAll("\n");
         try writer.writeAll("  \"// NAT 检测设置\": \"\",\n");
         try writer.print("  \"auto_detect_nat\": {s},\n", .{if (self.config.auto_detect_nat) "true" else "false"});
-        try writer.print("  \"stun_server\": \"{s}\",\n", .{self.config.stun_server});
-        try writer.print("  \"stun_port\": {d},\n", .{self.config.stun_port});
         try writer.print("  \"port_map_wan\": {d},\n", .{self.config.port_map_wan});
         try writer.writeAll("\n");
         try writer.writeAll("  \"// 日志设置\": \"\",\n");
@@ -421,16 +411,6 @@ pub const ConfigManager = struct {
         // 解析 auto_detect_nat
         if (findJsonBool(content, "auto_detect_nat")) |value| {
             self.config.auto_detect_nat = value;
-        }
-
-        // 解析 stun_server
-        if (findJsonString(content, "stun_server")) |value| {
-            self.config.stun_server = try self.allocator.dupe(u8, value);
-        }
-
-        // 解析 stun_port
-        if (findJsonNumber(content, "stun_port")) |value| {
-            self.config.stun_port = @intCast(value);
         }
 
         // 解析 port_map_wan
