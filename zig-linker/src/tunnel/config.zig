@@ -133,7 +133,7 @@ pub const ClientConfiguration = struct {
         });
         try list.append(allocator, .{
             .name = "MsQuic",
-            .enabled = false, // 默认禁用，需要特定平台支持
+            .enabled = true, // 默认启用
             .priority = 7,
             .timeout_seconds = 10,
             .retry_count = 2,
