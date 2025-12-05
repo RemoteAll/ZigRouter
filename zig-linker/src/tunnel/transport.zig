@@ -25,6 +25,10 @@ const TCP_AUTH_BYTES = GLOBAL_STRING ++ ".tcp.ttl1";
 /// TCP 结束字节
 const TCP_END_BYTES = GLOBAL_STRING ++ ".tcp.end1";
 
+/// Hello 握手消息 (打洞成功后双方互发验证)
+pub const HELLO_REQUEST = GLOBAL_STRING ++ ".hello.req";
+pub const HELLO_RESPONSE = GLOBAL_STRING ++ ".hello.ack";
+
 /// 传输错误
 pub const TransportError = error{
     /// 连接失败
@@ -103,6 +107,103 @@ pub const ITunnelConnection = struct {
         if (self.connected) {
             posix.close(self.socket);
             self.connected = false;
+        }
+    }
+
+    /// Hello 握手验证 - 确认打洞连接真正可用
+    /// 正向方先发送 Hello 请求，反向方收到后回复，双方都验证成功才算真正打通
+    /// @param is_initiator 是否是打洞发起方（正向方）
+    /// @param timeout_ms 超时时间（毫秒）
+    /// @return 握手是否成功
+    pub fn performHelloHandshake(self: *ITunnelConnection, is_initiator: bool, timeout_ms: u32) !bool {
+        if (!self.connected) return error.NotConnected;
+
+        var recv_buf: [128]u8 = undefined;
+        const protocol_type = self.info.protocol_type;
+
+        // 设置接收超时
+        net_utils.setRecvTimeout(self.socket, timeout_ms) catch {};
+
+        if (is_initiator) {
+            // 发起方：先发送 Hello 请求，等待响应
+            log.debug("Hello 握手: 发起方发送请求...", .{});
+
+            if (protocol_type == .udp) {
+                _ = posix.sendto(self.socket, HELLO_REQUEST, 0, &self.info.remote_endpoint.any, self.info.remote_endpoint.getOsSockLen()) catch |e| {
+                    log.err("Hello 握手: 发送请求失败: {any}", .{e});
+                    return false;
+                };
+            } else {
+                _ = posix.send(self.socket, HELLO_REQUEST, 0) catch |e| {
+                    log.err("Hello 握手: 发送请求失败: {any}", .{e});
+                    return false;
+                };
+            }
+
+            // 等待响应
+            const recv_len = if (protocol_type == .udp) blk: {
+                var from_addr: posix.sockaddr = undefined;
+                var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                break :blk posix.recvfrom(self.socket, &recv_buf, 0, &from_addr, &from_len) catch |e| {
+                    log.err("Hello 握手: 等待响应超时: {any}", .{e});
+                    return false;
+                };
+            } else blk: {
+                break :blk posix.recv(self.socket, &recv_buf, 0) catch |e| {
+                    log.err("Hello 握手: 等待响应超时: {any}", .{e});
+                    return false;
+                };
+            };
+
+            // 验证响应
+            if (recv_len >= HELLO_RESPONSE.len and std.mem.eql(u8, recv_buf[0..HELLO_RESPONSE.len], HELLO_RESPONSE)) {
+                log.info("Hello 握手: 收到对方响应，连接验证成功! ✓", .{});
+                return true;
+            } else {
+                log.warn("Hello 握手: 响应内容不匹配", .{});
+                return false;
+            }
+        } else {
+            // 响应方：先等待 Hello 请求，收到后回复
+            log.debug("Hello 握手: 响应方等待请求...", .{});
+
+            const recv_len = if (protocol_type == .udp) blk: {
+                var from_addr: posix.sockaddr = undefined;
+                var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                break :blk posix.recvfrom(self.socket, &recv_buf, 0, &from_addr, &from_len) catch |e| {
+                    log.err("Hello 握手: 等待请求超时: {any}", .{e});
+                    return false;
+                };
+            } else blk: {
+                break :blk posix.recv(self.socket, &recv_buf, 0) catch |e| {
+                    log.err("Hello 握手: 等待请求超时: {any}", .{e});
+                    return false;
+                };
+            };
+
+            // 验证请求
+            if (recv_len >= HELLO_REQUEST.len and std.mem.eql(u8, recv_buf[0..HELLO_REQUEST.len], HELLO_REQUEST)) {
+                log.debug("Hello 握手: 收到对方请求，发送响应...", .{});
+
+                // 发送响应
+                if (protocol_type == .udp) {
+                    _ = posix.sendto(self.socket, HELLO_RESPONSE, 0, &self.info.remote_endpoint.any, self.info.remote_endpoint.getOsSockLen()) catch |e| {
+                        log.err("Hello 握手: 发送响应失败: {any}", .{e});
+                        return false;
+                    };
+                } else {
+                    _ = posix.send(self.socket, HELLO_RESPONSE, 0) catch |e| {
+                        log.err("Hello 握手: 发送响应失败: {any}", .{e});
+                        return false;
+                    };
+                }
+
+                log.info("Hello 握手: 已发送响应，连接验证成功! ✓", .{});
+                return true;
+            } else {
+                log.warn("Hello 握手: 请求内容不匹配", .{});
+                return false;
+            }
         }
     }
 };
@@ -254,6 +355,7 @@ pub const TransportUdp = struct {
         var recv_buf: [1024]u8 = undefined;
         var from_addr: posix.sockaddr = undefined;
         var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        var got_auth = false; // 是否收到过认证消息
 
         while (true) {
             const recv_len = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len) catch |e| {
@@ -267,10 +369,10 @@ pub const TransportUdp = struct {
             if (recv_len == 0) continue;
 
             const data = recv_buf[0..recv_len];
+            const remote_ep = net.Address{ .any = from_addr };
 
             // 检查是否是结束消息
             if (std.mem.eql(u8, data, UDP_END_BYTES)) {
-                const remote_ep = net.Address{ .any = from_addr };
                 const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
 
                 log.info("UDP 反向打洞成功! 远程端点: {any}", .{remote_ep_converted});
@@ -294,8 +396,39 @@ pub const TransportUdp = struct {
 
                 log.logPunchSuccess(.udp, connection.info);
                 return connection;
-            } else {
-                // 回显消息
+            } else if (recv_len >= HELLO_REQUEST.len and std.mem.eql(u8, data[0..HELLO_REQUEST.len], HELLO_REQUEST)) {
+                // 收到 Hello 请求，说明对方已经打洞成功并开始握手
+                // 直接回复 Hello 响应，并返回连接成功
+                log.info("UDP 反向: 收到对方 Hello 请求，对方已打洞成功!", .{});
+                _ = posix.sendto(sock, HELLO_RESPONSE, 0, &from_addr, from_len) catch {};
+
+                const remote_ep_converted = net_utils.convertMappedAddress(remote_ep);
+                const connection = ITunnelConnection{
+                    .info = types.TunnelConnectionInfo{
+                        .remote_endpoint = remote_ep_converted,
+                        .remote_machine_id = info.remote.machine_id,
+                        .remote_machine_name = info.remote.machine_name,
+                        .transport_name = .udp,
+                        .direction = info.direction,
+                        .protocol_type = .udp,
+                        .tunnel_type = .p2p,
+                        .mode = .server,
+                        .ssl = info.ssl,
+                        .connected_at = std.time.timestamp(),
+                        .hello_completed = true, // 标记 Hello 已完成
+                    },
+                    .socket = sock,
+                    .connected = true,
+                };
+
+                log.logPunchSuccess(.udp, connection.info);
+                return connection;
+            } else if (std.mem.eql(u8, data, UDP_AUTH_BYTES)) {
+                // 收到认证消息，回显
+                got_auth = true;
+                _ = posix.sendto(sock, data, 0, &from_addr, from_len) catch {};
+            } else if (got_auth) {
+                // 已经收到过认证，可能是其他消息，回显
                 _ = posix.sendto(sock, data, 0, &from_addr, from_len) catch {};
             }
         }

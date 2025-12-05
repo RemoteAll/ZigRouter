@@ -1066,6 +1066,7 @@ pub const PunchClient = struct {
                 if (conn_result.success) {
                     punch_success = true;
                     punch_connection = conn_result.connection;
+                    error_msg = ""; // 成功时清空错误信息
                     log.info("  ✓ {s} 打洞成功!", .{transport_config.name});
                     break;
                 } else {
@@ -1081,7 +1082,7 @@ pub const PunchClient = struct {
                 .transport_name = transport_config.name,
                 .success = punch_success,
                 .duration_ms = method_duration,
-                .error_message = error_msg,
+                .error_message = if (punch_success) "" else error_msg, // 成功时不保留错误信息
             };
             method_idx += 1;
 
@@ -1202,12 +1203,50 @@ pub const PunchClient = struct {
         };
 
         if (connection) |conn| {
-            return PunchResult{
-                .success = true,
-                .connection = conn,
-                .error_message = "",
-                .duration_ms = 0,
+            // 打洞连接建立成功，执行 Hello 握手验证
+            var mutable_conn = conn;
+            const is_initiator = (begin.direction == .forward);
+
+            // 如果 Hello 握手已完成（对方已先完成打洞并发送了 Hello），直接返回成功
+            if (mutable_conn.info.hello_completed) {
+                log.info("Hello 握手已由对方完成，打洞连接已验证可用! ✓", .{});
+                return PunchResult{
+                    .success = true,
+                    .connection = mutable_conn,
+                    .error_message = "",
+                    .duration_ms = 0,
+                };
+            }
+
+            log.info("打洞连接已建立，正在执行 Hello 握手验证...", .{});
+
+            const hello_success = mutable_conn.performHelloHandshake(is_initiator, 3000) catch |e| {
+                log.err("Hello 握手异常: {any}", .{e});
+                mutable_conn.close();
+                return PunchResult{
+                    .success = false,
+                    .error_message = "Hello握手异常",
+                    .duration_ms = 0,
+                };
             };
+
+            if (hello_success) {
+                log.info("Hello 握手成功，打洞连接已验证可用! ✓", .{});
+                return PunchResult{
+                    .success = true,
+                    .connection = mutable_conn,
+                    .error_message = "",
+                    .duration_ms = 0,
+                };
+            } else {
+                log.warn("Hello 握手失败，连接不可用", .{});
+                mutable_conn.close();
+                return PunchResult{
+                    .success = false,
+                    .error_message = "Hello握手失败",
+                    .duration_ms = 0,
+                };
+            }
         }
 
         return PunchResult{

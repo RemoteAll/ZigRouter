@@ -306,6 +306,8 @@ pub const TunnelConnectionInfo = struct {
     ssl: bool = false,
     /// 连接时间戳
     connected_at: i64 = 0,
+    /// Hello 握手是否已完成（用于同步打洞成功状态）
+    hello_completed: bool = false,
 
     /// 格式化输出连接信息
     pub fn format(
