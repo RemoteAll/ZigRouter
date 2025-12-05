@@ -929,6 +929,34 @@ pub const PunchClient = struct {
 
                         // 显示打洞结果
                         self.printPunchResult(&punch_result, &begin);
+
+                        // 打洞成功后发送/接收 Hello 消息进行验证
+                        if (punch_result.success) {
+                            if (punch_result.connection) |*conn| {
+                                var connection = conn.*;
+
+                                // 发送 Hello 消息
+                                const hello_msg = "Hello";
+                                log.info(">>> 发送消息: {s}", .{hello_msg});
+                                _ = connection.send(hello_msg) catch |e| {
+                                    log.err("发送消息失败: {any}", .{e});
+                                };
+
+                                // 接收对方的 Hello 消息
+                                var recv_hello_buf: [256]u8 = undefined;
+                                if (connection.recvWithTimeout(&recv_hello_buf, 2000)) |recv_hello_len| {
+                                    if (recv_hello_len > 0) {
+                                        log.info("<<< 收到消息: {s}", .{recv_hello_buf[0..recv_hello_len]});
+                                    }
+                                } else |_| {
+                                    log.warn("接收对方消息超时", .{});
+                                }
+
+                                // 注意：不关闭连接，保持隧道可用
+                                log.info("隧道连接已建立，保持活跃状态", .{});
+                                // TODO: 将 connection 保存到连接池中供后续使用
+                            }
+                        }
                     } else {
                         log.warn("未配置打洞方式，无法执行实际打洞", .{});
                     }
@@ -1635,8 +1663,24 @@ pub fn main() !void {
 
                 if (result.connection) |*conn| {
                     var connection = conn.*;
-                    _ = connection.send("Hello from Zig Auto Punch!") catch {};
-                    connection.close();
+
+                    // 发送 Hello 消息
+                    const hello_msg = "Hello";
+                    log.info(">>> 发送消息: {s}", .{hello_msg});
+                    _ = connection.send(hello_msg) catch |e| {
+                        log.err("发送消息失败: {any}", .{e});
+                    };
+
+                    // 接收对方的 Hello 消息
+                    var recv_buf: [256]u8 = undefined;
+                    if (connection.recvWithTimeout(&recv_buf, 2000)) |recv_len| {
+                        if (recv_len > 0) {
+                            log.info("<<< 收到消息: {s}", .{recv_buf[0..recv_len]});
+                        }
+                    } else |_| {}
+
+                    // 注意：不关闭连接，保持隧道可用
+                    log.info("隧道连接已建立，保持活跃状态", .{});
                 }
             } else {
                 log.err("自动打洞失败，所有方式均未成功", .{});
@@ -1653,8 +1697,24 @@ pub fn main() !void {
 
                 if (result.connection) |*conn| {
                     var connection = conn.*;
-                    _ = connection.send("Hello from Zig!") catch {};
-                    connection.close();
+
+                    // 发送 Hello 消息
+                    const hello_msg = "Hello";
+                    log.info(">>> 发送消息: {s}", .{hello_msg});
+                    _ = connection.send(hello_msg) catch |e| {
+                        log.err("发送消息失败: {any}", .{e});
+                    };
+
+                    // 接收对方的 Hello 消息
+                    var recv_buf: [256]u8 = undefined;
+                    if (connection.recvWithTimeout(&recv_buf, 2000)) |recv_len| {
+                        if (recv_len > 0) {
+                            log.info("<<< 收到消息: {s}", .{recv_buf[0..recv_len]});
+                        }
+                    } else |_| {}
+
+                    // 注意：不关闭连接，保持隧道可用
+                    log.info("隧道连接已建立，保持活跃状态", .{});
                 }
             } else {
                 log.err("打洞失败: {s}", .{result.error_message});

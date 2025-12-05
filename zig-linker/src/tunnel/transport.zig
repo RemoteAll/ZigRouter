@@ -65,6 +65,17 @@ pub const ITunnelConnection = struct {
     /// 发送数据
     pub fn send(self: *ITunnelConnection, data: []const u8) !usize {
         if (!self.connected) return error.NotConnected;
+
+        // 对于 UDP，使用 sendto 发送到远程端点
+        if (self.info.protocol_type == .udp) {
+            const remote = self.info.remote_endpoint;
+            return posix.sendto(self.socket, data, 0, &remote.any, remote.getOsSockLen()) catch |e| {
+                self.connected = false;
+                return e;
+            };
+        }
+
+        // 对于 TCP，使用普通 send
         return posix.send(self.socket, data, 0) catch |e| {
             self.connected = false;
             return e;
@@ -100,6 +111,21 @@ pub const ITunnelConnection = struct {
         };
         addr.* = .{ .any = from_addr };
         return len;
+    }
+
+    /// 带超时的接收数据
+    pub fn recvWithTimeout(self: *ITunnelConnection, buf: []u8, timeout_ms: u32) !usize {
+        if (!self.connected) return error.NotConnected;
+
+        // 设置接收超时
+        net_utils.setRecvTimeout(self.socket, timeout_ms) catch {};
+
+        const result = posix.recv(self.socket, buf, 0) catch |e| {
+            if (e == error.WouldBlock) return 0;
+            return e;
+        };
+
+        return result;
     }
 
     /// 关闭连接
