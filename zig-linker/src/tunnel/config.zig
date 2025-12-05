@@ -69,9 +69,6 @@ pub const ClientConfiguration = struct {
     /// 端口映射端口（0 表示不使用）
     port_map_wan: u16 = 0,
 
-    /// 是否自动与新上线节点打洞
-    auto_punch_on_peer_online: bool = false,
-
     /// 日志级别: debug, info, warn, error
     log_level: []const u8 = "info",
     /// 是否启用彩色日志
@@ -441,11 +438,6 @@ pub const ConfigManager = struct {
             self.config.port_map_wan = @intCast(value);
         }
 
-        // 解析 auto_punch_on_peer_online
-        if (findJsonBool(content, "auto_punch_on_peer_online")) |value| {
-            self.config.auto_punch_on_peer_online = value;
-        }
-
         // 解析 log_level
         if (findJsonString(content, "log_level")) |value| {
             self.config.log_level = try self.allocator.dupe(u8, value);
@@ -533,7 +525,6 @@ pub const ConfigManager = struct {
         log.info("本机名称: {s}", .{if (self.config.machine_name.len > 0) self.config.machine_name else "(未设置)"});
         log.info("心跳间隔: {d}s", .{self.config.heartbeat_interval});
         log.info("自动重连: {s}", .{if (self.config.auto_reconnect) "是" else "否"});
-        log.info("自动打洞: {s}", .{if (self.config.auto_punch_on_peer_online) "是" else "否"});
         log.info("NAT检测: {s}", .{if (self.config.auto_detect_nat) "是" else "否"});
         log.info("日志级别: {s}", .{self.config.log_level});
         log.info("打洞方式 (按优先级排序):", .{});

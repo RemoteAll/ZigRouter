@@ -79,8 +79,6 @@ pub const ClientConfig = struct {
     tls_enabled: bool = true,
     /// 是否跳过服务器证书验证（用于自签名证书）
     tls_skip_verify: bool = false,
-    /// 是否自动与新上线节点打洞
-    auto_punch_on_peer_online: bool = false,
     /// 传输方式配置列表（打洞方式优先级）
     transports: []const config_mod.TransportConfig = &.{},
 };
@@ -1081,13 +1079,11 @@ pub const PunchClient = struct {
                         callback(self, &peer_info);
                     }
 
-                    // 如果启用了自动打洞，尝试与新节点建立连接
-                    if (self.config.auto_punch_on_peer_online) {
-                        log.info("自动打洞已启用，正在尝试与 {s} 打洞...", .{peer_info.machine_id});
-                        self.sendPunchRequest(peer_info.machine_id) catch |e| {
-                            log.err("发送打洞请求失败: {any}", .{e});
-                        };
-                    }
+                    // 自动与新上线节点打洞（默认行为）
+                    log.info("正在尝试与 {s} 打洞...", .{peer_info.machine_id});
+                    self.sendPunchRequest(peer_info.machine_id) catch |e| {
+                        log.err("发送打洞请求失败: {any}", .{e});
+                    };
                 },
                 .peer_offline => {
                     // 收到节点下线通知
@@ -1591,7 +1587,6 @@ pub fn main() !void {
 
     var config_path: []const u8 = "punch_client.json";
     var list_only = false;
-    var auto_punch = false;
     var cmd_server_addr: ?[]const u8 = null;
     var cmd_server_port: ?u16 = null;
     var cmd_machine_name: ?[]const u8 = null;
@@ -1630,9 +1625,6 @@ pub fn main() !void {
                 cmd_machine_name = args[i + 1];
                 i += 1;
             }
-        } else if (std.mem.eql(u8, arg, "--auto-punch")) {
-            // 自动与新上线节点打洞
-            auto_punch = true;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
             list_only = true;
         } else if (std.mem.eql(u8, arg, "--tls")) {
@@ -1677,8 +1669,6 @@ pub fn main() !void {
         // skip_verify 是 verify_server 的反向逻辑
         .tls_enabled = cmd_tls_enabled orelse config_manager.config.tls.enabled,
         .tls_skip_verify = cmd_tls_skip_verify orelse !config_manager.config.tls.verify_server,
-        // 自动打洞：命令行 --auto-punch 或配置文件中启用
-        .auto_punch_on_peer_online = auto_punch or config_manager.config.auto_punch_on_peer_online,
         // 传输方式配置
         .transports = config_manager.config.transports,
     };
@@ -1740,23 +1730,10 @@ pub fn main() !void {
         log.info("", .{});
     } else {
         // 进入消息循环，等待服务端协调的打洞请求
-        log.info("等待打洞请求...", .{});
-        if (client_config.auto_punch_on_peer_online) {
-            log.info("自动打洞已启用，将在新节点上线时自动发起打洞", .{});
-        }
+        log.info("进入被动模式，等待打洞请求...", .{});
+        log.info("新节点上线时将自动发起打洞", .{});
         try client.runLoop();
     }
-}
-
-fn parseTransportType(str: []const u8) types.TransportType {
-    if (std.mem.eql(u8, str, "udp")) return .udp;
-    if (std.mem.eql(u8, str, "udp_p2p_nat") or std.mem.eql(u8, str, "udp-p2p")) return .udp_p2p_nat;
-    if (std.mem.eql(u8, str, "tcp_p2p_nat") or std.mem.eql(u8, str, "tcp-p2p")) return .tcp_p2p_nat;
-    if (std.mem.eql(u8, str, "tcp_nutssb") or std.mem.eql(u8, str, "tcp-ttl")) return .tcp_nutssb;
-    if (std.mem.eql(u8, str, "udp_port_map") or std.mem.eql(u8, str, "udp-map")) return .udp_port_map;
-    if (std.mem.eql(u8, str, "tcp_port_map") or std.mem.eql(u8, str, "tcp-map")) return .tcp_port_map;
-    if (std.mem.eql(u8, str, "msquic") or std.mem.eql(u8, str, "quic")) return .msquic;
-    return .udp;
 }
 
 fn printUsage() void {
@@ -1765,12 +1742,16 @@ fn printUsage() void {
         \\
         \\用法: client [选项]
         \\
+        \\工作模式:
+        \\  启动后连接信令服务器，等待打洞请求。
+        \\  当有新节点上线时，会自动发起打洞。
+        \\  打洞方式由服务端协调，按配置文件中的优先级依次尝试。
+        \\
         \\选项:
         \\  -c, --config <路径>   配置文件路径 (默认: punch_client.json)
         \\  -s, --server <地址>   服务器地址 (覆盖配置文件)
         \\  -p, --port <端口>     服务器端口 (覆盖配置文件)
         \\  -n, --name <名称>     本机名称 (覆盖配置文件)
-        \\  --auto-punch          监听新节点上线并自动发起打洞
         \\  -l, --list            列出在线节点
         \\
         \\TLS 选项:
@@ -1780,32 +1761,15 @@ fn printUsage() void {
         \\
         \\  -h, --help            显示帮助信息
         \\
-        \\配置文件说明:
-        \\  首次运行时会自动生成默认配置文件 punch_client.json
-        \\  配置文件包含服务器设置、NAT 设置、TLS 设置和打洞方式优先级
-        \\  可编辑配置文件调整打洞方式的启用状态和优先级
-        \\
         \\示例:
-        \\  # 使用默认配置连接服务器并等待连接 (被动方)
-        \\  client
+        \\  # 启动客户端，连接服务器
+        \\  client -s 192.168.1.100 --no-tls
+        \\
+        \\  # 列出在线节点
+        \\  client -s 192.168.1.100 --no-tls -l
         \\
         \\  # 使用指定配置文件
         \\  client -c /path/to/config.json
-        \\
-        \\  # 列出在线节点
-        \\  client -l
-        \\
-        \\  # 监听新节点上线并自动打洞 (发起方)
-        \\  client --auto-punch
-        \\
-        \\  # 命令行参数覆盖配置文件
-        \\  client -s 192.168.1.100 -p 7891 -n "我的电脑"
-        \\
-        \\  # 使用自签名证书连接 (跳过验证)
-        \\  client -s example.com -k
-        \\
-        \\  # 本地调试禁用 TLS
-        \\  client -s 127.0.0.1 --no-tls
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -1824,12 +1788,4 @@ test "PunchClient init and deinit" {
 
     try std.testing.expect(!client.isConnected());
     try std.testing.expectEqual(types.NatType.unknown, client.getNatType());
-}
-
-test "parseTransportType" {
-    try std.testing.expectEqual(types.TransportType.udp, parseTransportType("udp"));
-    try std.testing.expectEqual(types.TransportType.udp_p2p_nat, parseTransportType("udp-p2p"));
-    try std.testing.expectEqual(types.TransportType.tcp_p2p_nat, parseTransportType("tcp-p2p"));
-    try std.testing.expectEqual(types.TransportType.tcp_nutssb, parseTransportType("tcp-ttl"));
-    try std.testing.expectEqual(types.TransportType.udp, parseTransportType("unknown"));
 }

@@ -180,39 +180,45 @@ zig build
 punch_server -p 7891
 ```
 
-### 客户端连接并等待打洞
+服务端选项：
+- `-p, --port <端口>` - 监听端口（默认 7891）
+- `--no-tls` - 禁用 TLS 加密（仅用于本地调试）
+- `-h, --help` - 显示帮助信息
+
+### 客户端连接
 
 ```bash
-punch_client -s 服务器IP -p 7891 -n "我的电脑"
+# 连接服务器，等待打洞请求
+punch_client -s 服务器IP --no-tls
+
+# 使用配置文件
+punch_client -c /path/to/config.json
 ```
+
+客户端选项：
+- `-c, --config <路径>` - 配置文件路径（默认 punch_client.json）
+- `-s, --server <地址>` - 服务器地址
+- `-p, --port <端口>` - 服务器端口
+- `-n, --name <名称>` - 本机名称
+- `-l, --list` - 列出在线节点
+- `--tls` - 强制启用 TLS 加密（默认已启用）
+- `--no-tls` - 禁用 TLS 加密（仅用于本地调试）
+- `-k, --skip-verify` - 跳过服务器证书验证
+- `-h, --help` - 显示帮助信息
 
 ### 列出在线节点
 
 ```bash
-punch_client -s 服务器IP -l
+punch_client -s 服务器IP --no-tls -l
 ```
 
-### 发起打洞
+### 工作模式
 
-```bash
-# UDP 打洞（默认）
-punch_client -s 服务器IP -t 目标节点ID -m udp
-
-# UDP 同时打开
-punch_client -s 服务器IP -t 目标节点ID -m udp-p2p
-
-# TCP 同时打开
-punch_client -s 服务器IP -t 目标节点ID -m tcp-p2p
-
-# TCP 低 TTL
-punch_client -s 服务器IP -t 目标节点ID -m tcp-ttl
-
-# UDP 端口映射
-punch_client -s 服务器IP -t 目标节点ID -m udp-map
-
-# TCP 端口映射
-punch_client -s 服务器IP -t 目标节点ID -m tcp-map
-```
+客户端启动后会：
+1. 连接信令服务器
+2. 等待其他节点的打洞请求
+3. 当有新节点上线时，自动发起打洞
+4. 打洞方式由服务端协调，按配置文件中的优先级依次尝试
 
 ## NAT 类型支持
 
