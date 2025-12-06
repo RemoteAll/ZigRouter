@@ -670,6 +670,18 @@ pub const PunchServer = struct {
                 .punch_request => {
                     try self.handlePunchRequestWithTls(client, msg_payload);
                 },
+                .punch_begin => {
+                    // 转发打洞开始消息到目标
+                    try self.handlePunchBeginForward(client, msg_payload);
+                },
+                .get_wan_port => {
+                    // 转发获取端口请求到目标
+                    try self.handleGetWanPortForward(client, msg_payload);
+                },
+                .get_wan_port_response => {
+                    // 转发端口响应到请求方
+                    try self.handleGetWanPortResponseForward(client, msg_payload);
+                },
                 .list_peers => {
                     try self.sendPeerListToClient(client);
                 },
@@ -973,6 +985,274 @@ pub const PunchServer = struct {
         try initiator.sendData(send_buf[0..total_len]);
 
         log.info("已向发起方 {s} 发送打洞开始通知，目标: {s}", .{ initiator.machine_id, target.machine_id });
+    }
+
+    /// 处理打洞开始消息转发
+    /// 客户端发送的 punch_begin 包含双方端口信息，服务器转发给目标并交换 Local/Remote
+    fn handlePunchBeginForward(self: *Self, from_client: *const ClientInfo, payload: []const u8) !void {
+        if (payload.len < 2) return;
+
+        // 解析目标机器 ID
+        const target_id_len = std.mem.readInt(u16, payload[0..2], .big);
+        if (payload.len < 2 + target_id_len) return;
+        const target_id = payload[2 .. 2 + target_id_len];
+
+        log.info("转发打洞开始消息: {s} -> {s}", .{ from_client.machine_id, target_id });
+
+        // 查找目标客户端
+        self.clients_mutex.lock();
+        const target = self.clients.get(target_id);
+        self.clients_mutex.unlock();
+
+        if (target == null) {
+            log.warn("目标客户端不在线: {s}", .{target_id});
+            return;
+        }
+
+        const target_client = target.?;
+
+        // 构建转发消息，需要交换源和目标的端口信息
+        // 原始格式:
+        //   target_id, source_nat, transport, direction, txn_id, flow_id, ssl, same_lan,
+        //   my_public, my_local, remote_public, remote_local
+        // 转发后（交换 my 和 remote）:
+        //   source_id, source_nat, transport, direction(反向), txn_id, flow_id, ssl, same_lan,
+        //   remote_public(原my), remote_local(原my), my_public(原remote), my_local(原remote)
+
+        var forward_buf: [1024]u8 = undefined;
+        var forward_stream = std.io.fixedBufferStream(&forward_buf);
+        const writer = forward_stream.writer();
+
+        // 将源 ID 替换为发起方 ID（目标需要知道谁发起的）
+        try writer.writeInt(u16, @intCast(from_client.machine_id.len), .big);
+        try writer.writeAll(from_client.machine_id);
+
+        // 跳过原始的 target_id，复制其余内容
+        var offset: usize = 2 + target_id_len;
+
+        // source_nat (1 byte)
+        if (offset >= payload.len) return;
+        try writer.writeByte(payload[offset]);
+        offset += 1;
+
+        // transport (1 byte)
+        if (offset >= payload.len) return;
+        try writer.writeByte(payload[offset]);
+        offset += 1;
+
+        // direction (1 byte) - 反转方向
+        if (offset >= payload.len) return;
+        const orig_direction = payload[offset];
+        const new_direction: u8 = if (orig_direction == @intFromEnum(types.TunnelDirection.forward))
+            @intFromEnum(types.TunnelDirection.reverse)
+        else
+            @intFromEnum(types.TunnelDirection.forward);
+        try writer.writeByte(new_direction);
+        offset += 1;
+
+        // txn_id (16 bytes)
+        if (offset + 16 > payload.len) return;
+        try writer.writeAll(payload[offset .. offset + 16]);
+        offset += 16;
+
+        // flow_id (4 bytes)
+        if (offset + 4 > payload.len) return;
+        try writer.writeAll(payload[offset .. offset + 4]);
+        offset += 4;
+
+        // ssl (1 byte)
+        if (offset >= payload.len) return;
+        try writer.writeByte(payload[offset]);
+        offset += 1;
+
+        // same_lan (1 byte)
+        if (offset >= payload.len) return;
+        try writer.writeByte(payload[offset]);
+        offset += 1;
+
+        // 解析并交换端点字符串
+        // my_public
+        if (offset + 2 > payload.len) return;
+        const my_public_len = std.mem.readInt(u16, payload[offset..][0..2], .big);
+        offset += 2;
+        if (offset + my_public_len > payload.len) return;
+        const my_public = payload[offset .. offset + my_public_len];
+        offset += my_public_len;
+
+        // my_local
+        if (offset + 2 > payload.len) return;
+        const my_local_len = std.mem.readInt(u16, payload[offset..][0..2], .big);
+        offset += 2;
+        if (offset + my_local_len > payload.len) return;
+        const my_local = payload[offset .. offset + my_local_len];
+        offset += my_local_len;
+
+        // remote_public
+        if (offset + 2 > payload.len) return;
+        const remote_public_len = std.mem.readInt(u16, payload[offset..][0..2], .big);
+        offset += 2;
+        if (offset + remote_public_len > payload.len) return;
+        const remote_public = payload[offset .. offset + remote_public_len];
+        offset += remote_public_len;
+
+        // remote_local
+        if (offset + 2 > payload.len) return;
+        const remote_local_len = std.mem.readInt(u16, payload[offset..][0..2], .big);
+        offset += 2;
+        if (offset + remote_local_len > payload.len) return;
+        const remote_local = payload[offset .. offset + remote_local_len];
+
+        // 交换写入：对于目标来说，发起方的端点是"对方的"
+        // 写入发起方的端点作为目标的"对方端点"
+        try writer.writeInt(u16, @intCast(my_public_len), .big);
+        if (my_public_len > 0) try writer.writeAll(my_public);
+        try writer.writeInt(u16, @intCast(my_local_len), .big);
+        if (my_local_len > 0) try writer.writeAll(my_local);
+
+        // 写入目标自己的端点（从消息中的 remote 字段，这是发起方之前获取的目标端口）
+        try writer.writeInt(u16, @intCast(remote_public_len), .big);
+        if (remote_public_len > 0) try writer.writeAll(remote_public);
+        try writer.writeInt(u16, @intCast(remote_local_len), .big);
+        if (remote_local_len > 0) try writer.writeAll(remote_local);
+
+        const forward_payload = forward_stream.getWritten();
+
+        // 发送转发消息
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .punch_begin,
+            .data_length = @intCast(forward_payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        var send_buf: [1280]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + forward_payload.len], forward_payload);
+        const total_len = protocol.MessageHeader.SIZE + forward_payload.len;
+
+        try target_client.sendData(send_buf[0..total_len]);
+
+        log.info("已转发打洞开始消息到 {s}", .{target_id});
+    }
+
+    /// 处理获取端口请求转发
+    /// A 请求 B 的端口，服务器转发给 B
+    fn handleGetWanPortForward(self: *Self, from_client: *const ClientInfo, payload: []const u8) !void {
+        if (payload.len < 2) return;
+
+        // 解析目标机器 ID
+        const target_id_len = std.mem.readInt(u16, payload[0..2], .big);
+        if (payload.len < 2 + target_id_len) return;
+        const target_id = payload[2 .. 2 + target_id_len];
+
+        log.info("转发端口请求: {s} -> {s}", .{ from_client.machine_id, target_id });
+
+        // 查找目标客户端
+        self.clients_mutex.lock();
+        const target = self.clients.get(target_id);
+        self.clients_mutex.unlock();
+
+        if (target == null) {
+            log.warn("目标客户端不在线: {s}", .{target_id});
+            return;
+        }
+
+        const target_client = target.?;
+
+        // 构建转发消息：将请求者 ID 放入 payload
+        var forward_buf: [256]u8 = undefined;
+        var forward_stream = std.io.fixedBufferStream(&forward_buf);
+        const writer = forward_stream.writer();
+
+        // 请求者 ID
+        try writer.writeInt(u16, @intCast(from_client.machine_id.len), .big);
+        try writer.writeAll(from_client.machine_id);
+
+        const forward_payload = forward_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .get_wan_port,
+            .data_length = @intCast(forward_payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        var send_buf: [512]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + forward_payload.len], forward_payload);
+        const total_len = protocol.MessageHeader.SIZE + forward_payload.len;
+
+        try target_client.sendData(send_buf[0..total_len]);
+
+        log.debug("已转发端口请求到 {s}", .{target_id});
+    }
+
+    /// 处理端口响应转发
+    /// B 响应端口信息，服务器转发给 A
+    fn handleGetWanPortResponseForward(self: *Self, from_client: *const ClientInfo, payload: []const u8) !void {
+        if (payload.len < 2) return;
+
+        // 解析目标机器 ID（响应的目标是原请求者）
+        const target_id_len = std.mem.readInt(u16, payload[0..2], .big);
+        if (payload.len < 2 + target_id_len) return;
+        const target_id = payload[2 .. 2 + target_id_len];
+
+        log.info("转发端口响应: {s} -> {s}", .{ from_client.machine_id, target_id });
+
+        // 查找目标客户端（原请求者）
+        self.clients_mutex.lock();
+        const target = self.clients.get(target_id);
+        self.clients_mutex.unlock();
+
+        if (target == null) {
+            log.warn("请求者不在线: {s}", .{target_id});
+            return;
+        }
+
+        const target_client = target.?;
+
+        // 构建转发消息：将响应者 ID 和端口信息发给请求者
+        var forward_buf: [512]u8 = undefined;
+        var forward_stream = std.io.fixedBufferStream(&forward_buf);
+        const writer = forward_stream.writer();
+
+        // 响应者 ID（原来的 from_client）
+        try writer.writeInt(u16, @intCast(from_client.machine_id.len), .big);
+        try writer.writeAll(from_client.machine_id);
+
+        // 复制端口信息（跳过目标 ID）
+        const remaining = payload[2 + target_id_len ..];
+        try writer.writeAll(remaining);
+
+        const forward_payload = forward_stream.getWritten();
+
+        const msg_header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .get_wan_port_response,
+            .data_length = @intCast(forward_payload.len),
+            .sequence = 0,
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        var send_buf: [768]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + forward_payload.len], forward_payload);
+        const total_len = protocol.MessageHeader.SIZE + forward_payload.len;
+
+        try target_client.sendData(send_buf[0..total_len]);
+
+        log.debug("已转发端口响应到 {s}", .{target_id});
     }
 
     /// 广播新客户端上线通知给其他在线客户端

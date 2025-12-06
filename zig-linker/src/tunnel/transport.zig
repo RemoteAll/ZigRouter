@@ -305,11 +305,9 @@ pub const TransportUdp = struct {
         log.debug("UDP 正向连接开始", .{});
 
         // 创建 UDP socket
-        // 判断是否是内网直连：如果第一个目标端点是内网地址，则使用注册时的端口
-        // 内网直连必须使用固定端口，否则对方不知道从哪个端口接收
-        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
-        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
-
+        // 必须使用注册端口（local.local 的端口），因为这个端口已经通过信令通知给对方
+        // 对方会向这个端口发送数据，我们也需要从这个端口发送（以便 NAT 建立正确的映射）
+        const bind_port = info.local.local.getPort();
         const local_ip = info.local.local;
         const bind_addr = net.Address.initIp4(
             @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
@@ -318,11 +316,7 @@ pub const TransportUdp = struct {
         const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
 
-        if (is_lan) {
-            log.debug("UDP 正向连接: 内网直连，使用固定端口 {d}", .{bind_port});
-        } else {
-            log.debug("UDP 正向连接: 公网打洞，使用动态端口", .{});
-        }
+        log.debug("UDP 正向连接: 使用注册端口 {d}", .{bind_port});
 
         // 打印本地绑定地址
         var local_sockaddr: posix.sockaddr = undefined;
@@ -418,10 +412,9 @@ pub const TransportUdp = struct {
         log.debug("UDP 反向连接开始", .{});
 
         // 创建 UDP socket
-        // 内网直连必须使用固定端口，否则对方不知道从哪个端口接收
-        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
-        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
-
+        // 反向连接（被动等待方）：必须使用注册时的端口
+        // 因为对方会发送到这个端口，依赖端口复用支持多连接
+        const bind_port: u16 = info.local.local.getPort();
         const local_ip = info.local.local;
         const bind_addr = net.Address.initIp4(
             @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
@@ -430,11 +423,7 @@ pub const TransportUdp = struct {
         const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
 
-        if (is_lan) {
-            log.debug("UDP 反向连接: 内网直连，使用固定端口 {d}", .{bind_port});
-        } else {
-            log.debug("UDP 反向连接: 公网打洞，使用动态端口", .{});
-        }
+        log.debug("UDP 反向连接: 使用注册端口 {d}", .{bind_port});
 
         // 打印本地绑定地址
         var local_sockaddr: posix.sockaddr = undefined;
@@ -663,9 +652,8 @@ pub const TransportUdpP2PNAT = struct {
         }
 
         // 创建 UDP socket
-        // 内网直连使用固定端口，公网打洞使用动态端口
-        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
-        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
+        // P2P NAT 模式：必须使用注册端口，因为对方需要知道我们从哪个端口发送
+        const bind_port = info.local.local.getPort();
 
         const local_ip = info.local.local;
         const bind_addr = net.Address.initIp4(
@@ -674,6 +662,8 @@ pub const TransportUdpP2PNAT = struct {
         );
         const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
+
+        log.debug("UDP P2PNAT: 使用注册端口 {d}（模式: {s}）", .{ bind_port, mode.toString() });
 
         // 打印本地绑定地址
         var local_sockaddr: posix.sockaddr = undefined;
@@ -1152,10 +1142,8 @@ pub const TransportUdpPortMap = struct {
         log.debug("UDP 端口映射正向连接", .{});
 
         // 创建 UDP socket
-        // 端口映射通常是公网场景，但也可能是内网，根据目标地址判断
-        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
-        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
-
+        // 端口映射模式也需要使用注册端口
+        const bind_port = info.local.local.getPort();
         const local_ip = info.local.local;
         const bind_addr = net.Address.initIp4(
             @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
@@ -1163,6 +1151,8 @@ pub const TransportUdpPortMap = struct {
         );
         const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
+
+        log.debug("UDP 端口映射: 使用注册端口 {d}", .{bind_port});
 
         // 构造目标地址 (使用端口映射端口)
         for (info.remote_endpoints) |ep| {

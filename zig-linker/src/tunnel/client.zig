@@ -126,6 +126,10 @@ pub const PunchClient = struct {
     /// 这是通过 UDP 探测时获取的本地地址，端口与 NAT 映射对应
     udp_local_addr: ?net.Address = null,
 
+    /// UDP 打洞 socket（保持 NAT 映射活跃）
+    /// 注册时创建，打洞时复用，保证端口与公网映射一致
+    udp_punch_socket: ?posix.socket_t = null,
+
     /// 是否已注册
     registered: bool = false,
 
@@ -147,6 +151,10 @@ pub const PunchClient = struct {
     /// 节点下线回调
     on_peer_offline: ?*const fn (*Self, *const protocol.PeerOffline) void = null,
 
+    /// 远程端口响应回调
+    /// 参数: (self, 源机器ID, 本地端点字符串, 公网端点字符串)
+    on_wan_port_response: ?*const fn (*Self, []const u8, []const u8, []const u8) void = null,
+
     /// NAT 类型检测线程
     nat_detect_thread: ?std.Thread = null,
 
@@ -162,12 +170,35 @@ pub const PunchClient = struct {
     /// 连接池互斥锁
     connections_mutex: std.Thread.Mutex = .{},
 
+    /// 待处理的打洞请求 (target_machine_id -> PendingPunchRequest)
+    pending_punch_requests: std.StringHashMap(PendingPunchRequest) = undefined,
+
+    /// 待处理请求互斥锁
+    pending_mutex: std.Thread.Mutex = .{},
+
+    /// 待处理打洞请求信息
+    pub const PendingPunchRequest = struct {
+        /// 目标机器 ID（已分配内存，需要释放）
+        target_id: []const u8,
+        /// 传输方式
+        transport: types.TransportType,
+        /// 事务 ID
+        transaction_id: [16]u8,
+        /// 创建时间（毫秒）
+        created_at: i64,
+        /// 本地端点（发起请求时的端点）
+        local_endpoint: ?net.Address,
+        /// 公网端点（发起请求时的端点）
+        public_endpoint: ?net.Address,
+    };
+
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Self {
         return Self{
             .allocator = allocator,
             .config = config,
             .transport_manager = transport_mod.TransportManager.init(allocator, .{}),
             .active_connections = std.StringHashMap(transport_mod.ITunnelConnection).init(allocator),
+            .pending_punch_requests = std.StringHashMap(PendingPunchRequest).init(allocator),
         };
     }
 
@@ -179,9 +210,19 @@ pub const PunchClient = struct {
             self.nat_detect_thread = null;
         }
 
+        // 清理待处理的打洞请求
+        self.clearPendingRequests();
+        self.pending_punch_requests.deinit();
+
         // 关闭所有活跃连接
         self.closeAllConnections();
         self.active_connections.deinit();
+
+        // 关闭 UDP 打洞 socket
+        if (self.udp_punch_socket) |sock| {
+            posix.close(sock);
+            self.udp_punch_socket = null;
+        }
 
         self.disconnect();
         self.transport_manager.deinit();
@@ -204,6 +245,51 @@ pub const PunchClient = struct {
         }
         self.active_connections.clearRetainingCapacity();
         log.debug("已关闭所有活跃连接", .{});
+    }
+
+    /// 清理所有待处理的打洞请求
+    fn clearPendingRequests(self: *Self) void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+
+        var it = self.pending_punch_requests.iterator();
+        while (it.next()) |entry| {
+            // 释放 target_id 字符串
+            self.allocator.free(entry.value_ptr.target_id);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.pending_punch_requests.clearRetainingCapacity();
+        log.debug("已清理所有待处理的打洞请求", .{});
+    }
+
+    /// 清理超时的待处理请求
+    fn cleanupExpiredPendingRequests(self: *Self) void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+
+        const now = std.time.milliTimestamp();
+        const timeout_ms: i64 = 10000; // 10秒超时
+
+        var to_remove: [32][]const u8 = undefined;
+        var remove_count: usize = 0;
+
+        var it = self.pending_punch_requests.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.created_at > timeout_ms) {
+                if (remove_count < to_remove.len) {
+                    to_remove[remove_count] = entry.key_ptr.*;
+                    remove_count += 1;
+                }
+            }
+        }
+
+        for (to_remove[0..remove_count]) |key| {
+            if (self.pending_punch_requests.fetchRemove(key)) |kv| {
+                log.warn("待处理打洞请求超时: {s}", .{kv.value.target_id});
+                self.allocator.free(kv.value.target_id);
+                self.allocator.free(kv.key);
+            }
+        }
     }
 
     /// 关闭与指定节点的连接
@@ -537,8 +623,30 @@ pub const PunchClient = struct {
         return null;
     }
 
+    /// 刷新 UDP 端口
+    /// 重新进行 UDP 探测以获取最新的公网映射端口
+    /// 在打洞前调用，确保使用最新的端口信息
+    pub fn refreshUdpPort(self: *Self) !void {
+        log.debug("刷新 UDP 端口...", .{});
+
+        const result = try self.getExternalAddrFromLinker();
+
+        // 更新本地和公网地址
+        self.udp_local_addr = result.local_addr;
+        if (result.public_addr) |pa| {
+            self.public_addr = pa;
+        }
+
+        var local_buf: [64]u8 = undefined;
+        var public_buf: [64]u8 = undefined;
+        log.info("UDP 端口刷新完成: 本地={s}, 公网={s}", .{
+            formatAddress(result.local_addr, &local_buf),
+            if (result.public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
+        });
+    }
+
     /// 通过 Linker 服务端 UDP 获取公网地址
-    /// 返回公网地址、本地 UDP 地址
+    /// 返回公网地址、本地 UDP 地址，并保存 UDP socket 用于打洞
     const LinkerExternalResult = struct {
         public_addr: ?net.Address,
         local_addr: net.Address, // UDP socket 的本地地址（包含正确的打洞端口）
@@ -547,16 +655,16 @@ pub const PunchClient = struct {
     fn getExternalAddrFromLinker(self: *Self) !LinkerExternalResult {
         log.debug("开始 UDP 探测，服务器: {s}:{d}", .{ self.config.server_addr, self.config.server_port });
 
-        // 创建 UDP socket
-        const udp_sock = try posix.socket(
-            posix.AF.INET,
-            posix.SOCK.DGRAM,
-            posix.IPPROTO.UDP,
-        );
-        defer posix.close(udp_sock);
+        // 如果已有 UDP socket，先关闭它
+        if (self.udp_punch_socket) |old_sock| {
+            posix.close(old_sock);
+            self.udp_punch_socket = null;
+        }
 
-        // Windows UDP bug 修复
-        net_utils.windowsUdpBugFix(udp_sock);
+        // 创建 UDP socket（启用端口复用）
+        const local_bind = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+        const udp_sock = try net_utils.createReuseUdpSocket(local_bind);
+        errdefer posix.close(udp_sock);
 
         // 设置超时 - Windows 使用毫秒
         if (@import("builtin").os.tag == .windows) {
@@ -573,10 +681,6 @@ pub const PunchClient = struct {
                 log.warn("设置 UDP 超时失败: {any}", .{e});
             };
         }
-
-        // 绑定本地地址
-        const local_bind = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
-        try posix.bind(udp_sock, &local_bind.any, local_bind.getOsSockLen());
 
         // 服务器地址
         const server_addr = try net.Address.parseIp4(self.config.server_addr, self.config.server_port);
@@ -679,13 +783,17 @@ pub const PunchClient = struct {
                 formatAddress(public_addr, &public_addr_buf),
             });
 
+            // 保存 UDP socket 用于后续打洞（不要关闭！）
+            self.udp_punch_socket = udp_sock;
+
             return LinkerExternalResult{
                 .public_addr = public_addr,
                 .local_addr = local_udp_addr,
             };
         }
 
-        // 所有重试都失败
+        // 所有重试都失败，关闭 socket
+        posix.close(udp_sock);
         log.warn("UDP 探测失败：服务端可能未开启 UDP 端口 {d}", .{self.config.server_port});
         return error.ConnectionTimedOut;
     }
@@ -1108,6 +1216,8 @@ pub const PunchClient = struct {
     }
 
     /// 处理来自服务器的打洞开始通知
+    /// 注意：此时不需要刷新端口，因为发起方已经获取了我们的最新端口
+    /// 请求里的 local 端口就是我们之前返回给发起方的最新端口
     pub fn handlePunchBegin(self: *Self, begin: *const protocol.PunchBegin, remote_endpoints: []const net.Address) !PunchResult {
         const start_time = std.time.milliTimestamp();
 
@@ -1115,8 +1225,26 @@ pub const PunchClient = struct {
         log.info("  收到打洞请求", .{});
         log.info("  发起方: {s}", .{begin.source_machine_id});
         log.info("  发起方 NAT: {s}", .{begin.source_nat_type.description()});
-        log.info("  传输方式: {s}", .{begin.transport_type.description()});
+        log.info("  传输方式: {s}", .{begin.transport.description()});
+        log.info("  消息中本地端点: {s}", .{begin.local_endpoint});
+        log.info("  消息中公网端点: {s}", .{begin.public_endpoint});
         log.info("========================================", .{});
+
+        // 解析消息中携带的本地端口信息（这是发起方之前获取的我方最新端口）
+        // 不要在这里刷新，否则会导致端口不匹配
+        const parsed_local = net_utils.parseEndpointString(begin.local_endpoint);
+        const parsed_public = net_utils.parseEndpointString(begin.public_endpoint);
+
+        // 如果消息中有端点信息就用，否则回退到当前已知的端点
+        const local_addr = parsed_local orelse self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+        const public_addr = parsed_public orelse self.public_addr;
+
+        var local_buf: [64]u8 = undefined;
+        var public_buf: [64]u8 = undefined;
+        log.info("使用端口: 本地 {s}, 公网 {s}", .{
+            formatAddress(local_addr, &local_buf),
+            if (public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
+        });
 
         // 构造传输信息 (注意方向是反的)
         const transport_info = types.TunnelTransportInfo{
@@ -1126,9 +1254,9 @@ pub const PunchClient = struct {
                 .machine_id = self.assigned_id,
                 .machine_name = self.config.machine_name,
                 .nat_type = self.local_nat_type,
-                // 关键：使用 UDP 本地地址进行打洞，确保端口与 NAT 映射匹配
-                .local = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
-                .public = self.public_addr,
+                // 使用消息中的端口，这是发起方获取的我方最新端口
+                .local = local_addr,
+                .public = public_addr,
                 .port_map_wan = self.config.port_map_wan,
                 .route_level = 8,
             },
@@ -1146,7 +1274,7 @@ pub const PunchClient = struct {
         };
 
         // 执行打洞
-        const connection = self.transport_manager.connect(begin.transport_type, &transport_info) catch |e| {
+        const connection = self.transport_manager.connect(begin.transport, &transport_info) catch |e| {
             _ = e;
             return PunchResult{
                 .success = false,
@@ -1255,6 +1383,303 @@ pub const PunchClient = struct {
         log.info("已发送打洞请求，目标: {s}", .{target_machine_id});
     }
 
+    /// 发起打洞（异步流程）
+    /// 1. 刷新本地端口
+    /// 2. 发送获取远程端口请求
+    /// 3. 等待远程端口响应后在消息循环中继续打洞
+    pub fn initiatePunch(self: *Self, target_machine_id: []const u8, transport: types.TransportType) !void {
+        if (self.server_socket == null) return error.NotConnected;
+
+        log.info("", .{});
+        log.info("╔══════════════════════════════════════════════════════════════╗", .{});
+        log.info("║              发起打洞流程                                    ║", .{});
+        log.info("╠══════════════════════════════════════════════════════════════╣", .{});
+        log.info("║ 目标: {s}", .{target_machine_id});
+        log.info("║ 传输方式: {s}", .{transport.description()});
+        log.info("╚══════════════════════════════════════════════════════════════╝", .{});
+
+        // 第一步：刷新本地 UDP 端口
+        log.info("步骤 1/3: 刷新本地 UDP 端口...", .{});
+        self.refreshUdpPort() catch |e| {
+            log.warn("刷新本地端口失败: {any}，使用已有端口", .{e});
+        };
+
+        // 保存当前端口状态
+        const local_endpoint = self.udp_local_addr;
+        const public_endpoint = self.public_addr;
+
+        var local_buf: [64]u8 = undefined;
+        var public_buf: [64]u8 = undefined;
+        log.info("本地端口: {s}, 公网端口: {s}", .{
+            if (local_endpoint) |le| formatAddress(le, &local_buf) else "未知",
+            if (public_endpoint) |pe| formatAddress(pe, &public_buf) else "未知",
+        });
+
+        // 第二步：创建待处理请求记录
+        log.info("步骤 2/3: 请求目标端口信息...", .{});
+
+        const transaction_id = protocol.generateTransactionId();
+
+        // 分配并保存 target_id
+        const target_id_copy = try self.allocator.dupe(u8, target_machine_id);
+        errdefer self.allocator.free(target_id_copy);
+
+        const pending_request = PendingPunchRequest{
+            .target_id = target_id_copy,
+            .transport = transport,
+            .transaction_id = transaction_id,
+            .created_at = std.time.milliTimestamp(),
+            .local_endpoint = local_endpoint,
+            .public_endpoint = public_endpoint,
+        };
+
+        // 保存到待处理列表
+        {
+            self.pending_mutex.lock();
+            defer self.pending_mutex.unlock();
+
+            // 分配 key
+            const key_copy = try self.allocator.dupe(u8, target_machine_id);
+            errdefer self.allocator.free(key_copy);
+
+            // 如果已有针对该目标的请求，先移除
+            if (self.pending_punch_requests.fetchRemove(target_machine_id)) |old| {
+                self.allocator.free(old.value.target_id);
+                self.allocator.free(old.key);
+            }
+
+            try self.pending_punch_requests.put(key_copy, pending_request);
+        }
+
+        // 第三步：发送获取远程端口请求
+        try self.sendGetWanPortRequest(target_machine_id);
+
+        log.info("步骤 3/3: 等待目标端口响应...", .{});
+        log.info("（响应后将在消息循环中自动继续打洞流程）", .{});
+    }
+
+    /// 发送获取远程端口请求
+    /// 在打洞前调用，让目标刷新端口并返回最新端口信息
+    pub fn sendGetWanPortRequest(self: *Self, target_machine_id: []const u8) !void {
+        if (self.server_socket == null) return error.NotConnected;
+
+        // 构建请求 payload: 目标机器 ID
+        var payload_buf: [256]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 目标机器 ID (2 bytes length + data)
+        try writer.writeInt(u16, @intCast(target_machine_id.len), .big);
+        try writer.writeAll(target_machine_id);
+
+        const payload = payload_stream.getWritten();
+
+        const header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .get_wan_port,
+            .data_length = @intCast(payload.len),
+            .sequence = self.nextSequence(),
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try header.serialize(&header_buf);
+
+        // 合并 header 和 payload
+        var send_buf: [512]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(send_buf[0..total_len]);
+        } else {
+            _ = try posix.send(self.server_socket.?, send_buf[0..total_len], 0);
+        }
+
+        log.debug("已发送获取远程端口请求，目标: {s}", .{target_machine_id});
+    }
+
+    /// 发送获取端口响应（当被请求时调用）
+    /// 刷新本地端口并返回最新端口信息
+    pub fn sendGetWanPortResponse(self: *Self, requester_id: []const u8) !void {
+        if (self.server_socket == null) return error.NotConnected;
+
+        // 刷新本地端口
+        self.refreshUdpPort() catch |e| {
+            log.warn("刷新 UDP 端口失败: {any}", .{e});
+        };
+
+        // 获取最新端口信息
+        const local_addr = self.udp_local_addr orelse self.local_addr;
+        const public_addr = self.public_addr;
+
+        // 构建响应 payload
+        var payload_buf: [512]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 请求者 ID (2 bytes length + data)
+        try writer.writeInt(u16, @intCast(requester_id.len), .big);
+        try writer.writeAll(requester_id);
+
+        // 本地端点字符串 (2 bytes length + data)
+        var local_str_buf: [64]u8 = undefined;
+        const local_str = if (local_addr) |la| formatAddress(la, &local_str_buf) else "";
+        try writer.writeInt(u16, @intCast(local_str.len), .big);
+        if (local_str.len > 0) try writer.writeAll(local_str);
+
+        // 公网端点字符串 (2 bytes length + data)
+        var public_str_buf: [64]u8 = undefined;
+        const public_str = if (public_addr) |pa| formatAddress(pa, &public_str_buf) else "";
+        try writer.writeInt(u16, @intCast(public_str.len), .big);
+        if (public_str.len > 0) try writer.writeAll(public_str);
+
+        const payload = payload_stream.getWritten();
+
+        const header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .get_wan_port_response,
+            .data_length = @intCast(payload.len),
+            .sequence = self.nextSequence(),
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try header.serialize(&header_buf);
+
+        // 合并 header 和 payload
+        var send_buf: [768]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(send_buf[0..total_len]);
+        } else {
+            _ = try posix.send(self.server_socket.?, send_buf[0..total_len], 0);
+        }
+
+        log.info("已发送端口响应给 {s}: 本地={s}, 公网={s}", .{ requester_id, local_str, public_str });
+    }
+
+    /// 发送包含双方端口信息的打洞开始消息
+    /// 这是发起方在收到目标端口响应后调用的
+    /// 服务器会将此消息转发给目标，并交换 Local/Remote 字段
+    fn sendPunchBeginWithPorts(
+        self: *Self,
+        target_id: []const u8,
+        transport: types.TransportType,
+        transaction_id: [16]u8,
+        my_local: ?net.Address,
+        my_public: ?net.Address,
+        remote_local: ?net.Address,
+        remote_public: ?net.Address,
+    ) !void {
+        if (self.server_socket == null) return error.NotConnected;
+
+        // 构建打洞开始消息 payload
+        // 格式：
+        // - target_id: 2 bytes len + data
+        // - source_nat_type: 1 byte
+        // - transport: 1 byte
+        // - direction: 1 byte (forward)
+        // - transaction_id: 16 bytes
+        // - flow_id: 4 bytes
+        // - ssl: 1 byte
+        // - same_lan: 1 byte
+        // - my_public_endpoint: 2 bytes len + string
+        // - my_local_endpoint: 2 bytes len + string
+        // - remote_public_endpoint: 2 bytes len + string
+        // - remote_local_endpoint: 2 bytes len + string
+
+        var payload_buf: [1024]u8 = undefined;
+        var payload_stream = std.io.fixedBufferStream(&payload_buf);
+        const writer = payload_stream.writer();
+
+        // 目标机器 ID
+        try writer.writeInt(u16, @intCast(target_id.len), .big);
+        try writer.writeAll(target_id);
+
+        // 源 NAT 类型
+        try writer.writeByte(@intFromEnum(self.local_nat_type));
+
+        // 传输方式
+        try writer.writeByte(@intFromEnum(transport));
+
+        // 方向 (正向)
+        try writer.writeByte(@intFromEnum(types.TunnelDirection.forward));
+
+        // 事务 ID
+        try writer.writeAll(&transaction_id);
+
+        // 流 ID
+        try writer.writeInt(u32, 0, .big);
+
+        // SSL
+        try writer.writeByte(if (self.config.tls_enabled) 1 else 0);
+
+        // 同局域网标志 (简单判断：如果 public 相同且 local 可互通)
+        const same_lan: bool = false; // TODO: 实现同局域网检测
+        try writer.writeByte(if (same_lan) 1 else 0);
+
+        // 我方公网端点字符串
+        var my_public_str_buf: [64]u8 = undefined;
+        const my_public_str = if (my_public) |addr| formatAddress(addr, &my_public_str_buf) else "";
+        try writer.writeInt(u16, @intCast(my_public_str.len), .big);
+        if (my_public_str.len > 0) try writer.writeAll(my_public_str);
+
+        // 我方本地端点字符串
+        var my_local_str_buf: [64]u8 = undefined;
+        const my_local_str = if (my_local) |addr| formatAddress(addr, &my_local_str_buf) else "";
+        try writer.writeInt(u16, @intCast(my_local_str.len), .big);
+        if (my_local_str.len > 0) try writer.writeAll(my_local_str);
+
+        // 对方公网端点字符串（服务器转发时会交换）
+        var remote_public_str_buf: [64]u8 = undefined;
+        const remote_public_str = if (remote_public) |addr| formatAddress(addr, &remote_public_str_buf) else "";
+        try writer.writeInt(u16, @intCast(remote_public_str.len), .big);
+        if (remote_public_str.len > 0) try writer.writeAll(remote_public_str);
+
+        // 对方本地端点字符串
+        var remote_local_str_buf: [64]u8 = undefined;
+        const remote_local_str = if (remote_local) |addr| formatAddress(addr, &remote_local_str_buf) else "";
+        try writer.writeInt(u16, @intCast(remote_local_str.len), .big);
+        if (remote_local_str.len > 0) try writer.writeAll(remote_local_str);
+
+        const payload = payload_stream.getWritten();
+
+        const header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .punch_begin,
+            .data_length = @intCast(payload.len),
+            .sequence = self.nextSequence(),
+        };
+
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try header.serialize(&header_buf);
+
+        // 合并 header 和 payload
+        var send_buf: [1280]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE .. protocol.MessageHeader.SIZE + payload.len], payload);
+        const total_len = protocol.MessageHeader.SIZE + payload.len;
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(send_buf[0..total_len]);
+        } else {
+            _ = try posix.send(self.server_socket.?, send_buf[0..total_len], 0);
+        }
+
+        log.info("已发送打洞开始消息到 {s}", .{target_id});
+        log.info("  我方端点: 本地={s}, 公网={s}", .{ my_local_str, my_public_str });
+        log.info("  对方端点: 本地={s}, 公网={s}", .{ remote_local_str, remote_public_str });
+    }
+
     /// 运行消息循环
     pub fn runLoop(self: *Self) !void {
         const sock = self.server_socket orelse return error.NotConnected;
@@ -1262,12 +1687,21 @@ pub const PunchClient = struct {
         var recv_buf: [4096]u8 = undefined;
         var last_heartbeat = std.time.timestamp();
 
+        var last_cleanup: i64 = 0;
+
         while (true) {
             // 检查心跳
             const now = std.time.timestamp();
             if (now - last_heartbeat >= self.config.heartbeat_interval) {
                 self.sendHeartbeat() catch {};
                 last_heartbeat = now;
+            }
+
+            // 定期清理超时的待处理请求
+            const now_ms = std.time.milliTimestamp();
+            if (now_ms - last_cleanup >= 5000) { // 每 5 秒检查一次
+                self.cleanupExpiredPendingRequests();
+                last_cleanup = now_ms;
             }
 
             // 设置接收超时
@@ -1482,20 +1916,47 @@ pub const PunchClient = struct {
                                 log.err("发送消息失败: {any}", .{e});
                             };
 
-                            if (mutable_conn.recvWithTimeout(&hello_recv_buf, 3000)) |hello_len| {
-                                if (hello_len > 0) {
-                                    log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
+                            // 等待对方 Hello，循环接收直到收到非协议数据
+                            var got_hello = false;
+                            var recv_attempts: u32 = 0;
+                            while (recv_attempts < 30 and !got_hello) : (recv_attempts += 1) {
+                                if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |hello_len| {
+                                    if (hello_len > 0) {
+                                        // 跳过协议残留数据
+                                        if (hello_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..hello_len], "linker.zig")) {
+                                            log.debug("跳过协议数据: {s}", .{hello_recv_buf[0..hello_len]});
+                                            continue;
+                                        }
+                                        log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
+                                        got_hello = true;
+                                    }
+                                } else |_| {
+                                    // 单次超时，继续等待
                                 }
-                            } else |_| {
+                            }
+                            if (!got_hello) {
                                 log.warn("接收对方消息超时", .{});
                             }
                         } else {
-                            // 被动方：先收后发
-                            if (mutable_conn.recvWithTimeout(&hello_recv_buf, 3000)) |hello_len| {
-                                if (hello_len > 0) {
-                                    log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
+                            // 被动方：先收后发，循环接收直到收到非协议数据
+                            var got_hello = false;
+                            var recv_attempts: u32 = 0;
+                            while (recv_attempts < 30 and !got_hello) : (recv_attempts += 1) {
+                                if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |hello_len| {
+                                    if (hello_len > 0) {
+                                        // 跳过协议残留数据
+                                        if (hello_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..hello_len], "linker.zig")) {
+                                            log.debug("跳过协议数据: {s}", .{hello_recv_buf[0..hello_len]});
+                                            continue;
+                                        }
+                                        log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
+                                        got_hello = true;
+                                    }
+                                } else |_| {
+                                    // 单次超时，继续等待
                                 }
-                            } else |_| {
+                            }
+                            if (!got_hello) {
                                 log.warn("接收对方消息超时", .{});
                             }
 
@@ -1534,10 +1995,10 @@ pub const PunchClient = struct {
                         callback(self, &peer_info);
                     }
 
-                    // 自动与新上线节点打洞（默认行为）
+                    // 自动与新上线节点打洞（使用异步流程）
                     log.info("正在尝试与 {s} 打洞...", .{peer_info.machine_id});
-                    self.sendPunchRequest(peer_info.machine_id) catch |e| {
-                        log.err("发送打洞请求失败: {any}", .{e});
+                    self.initiatePunch(peer_info.machine_id, .udp) catch |e| {
+                        log.err("发起打洞失败: {any}", .{e});
                     };
                 },
                 .peer_offline => {
@@ -1556,6 +2017,223 @@ pub const PunchClient = struct {
                     // 调用回调
                     if (self.on_peer_offline) |callback| {
                         callback(self, &peer_info);
+                    }
+                },
+                .get_wan_port => {
+                    // 收到获取端口请求，需要刷新端口并响应
+                    const loop_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
+                    if (loop_payload.len < 2) continue;
+
+                    const requester_id_len = std.mem.readInt(u16, loop_payload[0..2], .big);
+                    if (loop_payload.len < 2 + requester_id_len) continue;
+                    const requester_id = loop_payload[2 .. 2 + requester_id_len];
+
+                    log.info("收到端口查询请求，来自: {s}", .{requester_id});
+
+                    // 发送端口响应（会自动刷新端口）
+                    self.sendGetWanPortResponse(requester_id) catch |e| {
+                        log.err("发送端口响应失败: {any}", .{e});
+                    };
+                },
+                .get_wan_port_response => {
+                    // 收到端口响应
+                    const loop_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
+                    if (loop_payload.len < 2) continue;
+
+                    var offset: usize = 0;
+
+                    // 源机器 ID
+                    const source_id_len = std.mem.readInt(u16, loop_payload[offset..][0..2], .big);
+                    offset += 2;
+                    if (loop_payload.len < offset + source_id_len) continue;
+                    const source_id = loop_payload[offset .. offset + source_id_len];
+                    offset += source_id_len;
+
+                    // 本地端点
+                    if (loop_payload.len < offset + 2) continue;
+                    const local_len = std.mem.readInt(u16, loop_payload[offset..][0..2], .big);
+                    offset += 2;
+                    if (loop_payload.len < offset + local_len) continue;
+                    const remote_local_str = loop_payload[offset .. offset + local_len];
+                    offset += local_len;
+
+                    // 公网端点
+                    if (loop_payload.len < offset + 2) continue;
+                    const public_len = std.mem.readInt(u16, loop_payload[offset..][0..2], .big);
+                    offset += 2;
+                    if (loop_payload.len < offset + public_len) continue;
+                    const remote_public_str = loop_payload[offset .. offset + public_len];
+
+                    log.info("收到 {s} 的端口响应: 本地={s}, 公网={s}", .{ source_id, remote_local_str, remote_public_str });
+
+                    // 查找待处理的打洞请求
+                    var pending_request: ?PendingPunchRequest = null;
+                    {
+                        self.pending_mutex.lock();
+                        defer self.pending_mutex.unlock();
+
+                        if (self.pending_punch_requests.fetchRemove(source_id)) |kv| {
+                            pending_request = kv.value;
+                            self.allocator.free(kv.key);
+                        }
+                    }
+
+                    if (pending_request) |req| {
+                        defer self.allocator.free(req.target_id);
+
+                        log.info("找到待处理的打洞请求，继续打洞流程...", .{});
+
+                        // 解析远程端点
+                        const remote_local = net_utils.parseEndpointString(remote_local_str);
+                        const remote_public = net_utils.parseEndpointString(remote_public_str);
+
+                        // 发送包含双方端口信息的打洞开始消息给服务器转发给对方
+                        self.sendPunchBeginWithPorts(
+                            req.target_id,
+                            req.transport,
+                            req.transaction_id,
+                            req.local_endpoint,
+                            req.public_endpoint,
+                            remote_local,
+                            remote_public,
+                        ) catch |e| {
+                            log.err("发送打洞开始消息失败: {any}", .{e});
+                            continue;
+                        };
+
+                        // 发起方自己也要开始打洞！
+                        // 构造远程端点列表
+                        var remote_endpoints: [2]net.Address = undefined;
+                        var endpoint_count: usize = 0;
+                        if (remote_local) |addr| {
+                            remote_endpoints[endpoint_count] = addr;
+                            endpoint_count += 1;
+                        }
+                        if (remote_public) |addr| {
+                            remote_endpoints[endpoint_count] = addr;
+                            endpoint_count += 1;
+                        }
+
+                        if (endpoint_count == 0) {
+                            log.err("没有可用的远程端点", .{});
+                            continue;
+                        }
+
+                        // 构造传输信息
+                        const transport_info = types.TunnelTransportInfo{
+                            .flow_id = 0,
+                            .direction = .forward, // 发起方是正向
+                            .local = types.EndpointInfo{
+                                .machine_id = self.assigned_id,
+                                .machine_name = self.config.machine_name,
+                                .nat_type = self.local_nat_type,
+                                .local = req.local_endpoint orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                                .local_ips = &.{},
+                                .remote = req.public_endpoint,
+                                .port_map_wan = self.config.port_map_wan,
+                                .port_map_lan = 0,
+                                .route_level = 8,
+                            },
+                            .remote = types.EndpointInfo{
+                                .machine_id = req.target_id,
+                                .machine_name = "",
+                                .nat_type = .unknown,
+                                .local = remote_endpoints[0],
+                                .local_ips = &.{},
+                                .remote = if (endpoint_count > 1) remote_endpoints[1] else null,
+                                .port_map_wan = 0,
+                                .port_map_lan = 0,
+                                .route_level = 8,
+                            },
+                            .remote_endpoints = remote_endpoints[0..endpoint_count],
+                            .ssl = false,
+                        };
+
+                        log.info("发起方开始打洞连接...", .{});
+                        const start_time = std.time.milliTimestamp();
+
+                        // 发起方调用 connect
+                        const connection = self.transport_manager.connect(req.transport, &transport_info) catch |e| {
+                            log.err("发起打洞失败: {any}", .{e});
+                            continue;
+                        };
+
+                        const duration = @as(u64, @intCast(std.time.milliTimestamp() - start_time));
+
+                        if (connection) |conn| {
+                            const remote_addr_str = log.formatAddress(conn.info.remote_endpoint);
+                            log.info("========== 打洞成功 ==========", .{});
+                            log.info("传输方式: {s}", .{req.transport.description()});
+                            log.info("耗时: {d} ms", .{duration});
+                            log.info("远程端点: {s}", .{std.mem.sliceTo(&remote_addr_str, 0)});
+                            log.info("方向: 正向 (我方主动)", .{});
+                            log.info("==============================", .{});
+
+                            var mutable_conn = conn;
+                            var hello_recv_buf: [256]u8 = undefined;
+
+                            // 清空 UDP 缓冲区中的打洞协议残留数据
+                            var flush_count: u32 = 0;
+                            while (flush_count < 10) : (flush_count += 1) {
+                                if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |flush_len| {
+                                    if (flush_len == 0) break;
+                                    // 检查是否是协议数据（以 "linker.zig" 开头）
+                                    if (flush_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..flush_len], "linker.zig")) {
+                                        log.debug("清除协议残留数据: {s}", .{hello_recv_buf[0..flush_len]});
+                                        continue;
+                                    }
+                                    // 不是协议数据，可能是对方的 Hello，退出清空循环
+                                    break;
+                                } else |_| {
+                                    // 超时，缓冲区已空
+                                    break;
+                                }
+                            }
+
+                            // 发起方先发 Hello
+                            const hello_msg = "Hello";
+                            log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, req.target_id, hello_msg });
+                            _ = mutable_conn.send(hello_msg) catch |e| {
+                                log.err("发送消息失败: {any}", .{e});
+                            };
+
+                            // 等待对方 Hello，需要循环接收直到收到非协议数据
+                            var got_hello = false;
+                            var recv_attempts: u32 = 0;
+                            while (recv_attempts < 30 and !got_hello) : (recv_attempts += 1) {
+                                if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |hello_len| {
+                                    if (hello_len > 0) {
+                                        // 跳过协议残留数据
+                                        if (hello_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..hello_len], "linker.zig")) {
+                                            log.debug("跳过协议数据: {s}", .{hello_recv_buf[0..hello_len]});
+                                            continue;
+                                        }
+                                        log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, req.target_id, hello_recv_buf[0..hello_len] });
+                                        got_hello = true;
+                                    }
+                                } else |_| {
+                                    // 单次超时，继续等待
+                                }
+                            }
+                            if (!got_hello) {
+                                log.warn("接收对方消息超时", .{});
+                            }
+
+                            log.info("隧道连接已建立，保持活跃状态", .{});
+                            self.saveConnection(req.target_id, mutable_conn);
+                        } else {
+                            log.err("========== 打洞失败 ==========", .{});
+                            log.err("传输方式: {s}", .{req.transport.description()});
+                            log.err("耗时: {d} ms", .{duration});
+                            log.err("==============================", .{});
+                        }
+                    } else {
+                        log.warn("未找到 {s} 的待处理打洞请求", .{source_id});
+
+                        // 调用回调（如果有）
+                        if (self.on_wan_port_response) |callback| {
+                            callback(self, source_id, remote_local_str, remote_public_str);
+                        }
                     }
                 },
                 else => {

@@ -32,6 +32,10 @@ pub const MessageType = enum(u8) {
     punch_fail = 0x13,
     /// 打洞响应
     punch_response = 0x14,
+    /// 获取远端外网端口请求（发给服务器，服务器转发给目标节点）
+    get_wan_port = 0x15,
+    /// 获取远端外网端口响应
+    get_wan_port_response = 0x16,
     /// 查询节点
     query_peer = 0x20,
     /// 查询响应
@@ -60,6 +64,9 @@ pub const MessageType = enum(u8) {
             .punch_begin => "打洞开始",
             .punch_success => "打洞成功",
             .punch_fail => "打洞失败",
+            .punch_response => "打洞响应",
+            .get_wan_port => "获取外网端口",
+            .get_wan_port_response => "外网端口响应",
             .query_peer => "查询节点",
             .query_response => "查询响应",
             .list_peers => "列出节点",

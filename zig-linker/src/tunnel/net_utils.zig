@@ -180,6 +180,16 @@ pub fn isPrivateAddress(addr: net.Address) bool {
 /// 设置 Socket 端口复用 (SO_REUSEADDR)
 pub fn setReuseAddr(sock: posix.socket_t, enable: bool) SocketOptionError!void {
     const value: c_int = if (enable) 1 else 0;
+
+    // Windows: 先禁用 SO_EXCLUSIVEADDRUSE，这对应 C# 的 ExclusiveAddressUse = false
+    // SO_EXCLUSIVEADDRUSE = -5 (0xFFFFFFFB)，需要直接调用 Windows API
+    if (builtin.os.tag == .windows) {
+        const ws2_32 = @import("std").os.windows.ws2_32;
+        const SO_EXCLUSIVEADDRUSE: c_int = -5;
+        const exclusive_value: c_int = 0; // 禁用独占模式
+        _ = ws2_32.setsockopt(sock, posix.SOL.SOCKET, SO_EXCLUSIVEADDRUSE, @ptrCast(&std.mem.toBytes(exclusive_value)), @sizeOf(c_int));
+    }
+
     posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(value)) catch {
         return SocketOptionError.SetOptionFailed;
     };
@@ -777,6 +787,79 @@ test "getPort and setPort" {
 
     try std.testing.expectEqual(@as(u16, 9090), getPort(ipv4_addr));
     try std.testing.expectEqual(@as(u16, 8443), getPort(ipv6_addr));
+}
+
+// ============ 端点字符串解析 ============
+
+/// 解析端点字符串到 net.Address
+/// 支持格式: "IP:port" 或 "[IPv6]:port"
+/// 例如: "192.168.1.1:12345" 或 "[::1]:12345" 或 "[2001:db8::1]:80"
+pub fn parseEndpointString(endpoint_str: []const u8) ?net.Address {
+    if (endpoint_str.len == 0) return null;
+
+    // 检查是否为 IPv6 格式 [IPv6]:port
+    if (endpoint_str[0] == '[') {
+        // 查找 ]:
+        if (std.mem.indexOf(u8, endpoint_str, "]:")) |bracket_pos| {
+            const ipv6_str = endpoint_str[1..bracket_pos];
+            const port_str = endpoint_str[bracket_pos + 2 ..];
+
+            const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+
+            // 解析 IPv6 地址
+            // 创建 null-terminated 字符串
+            var ip_buf: [128]u8 = undefined;
+            if (ipv6_str.len >= ip_buf.len) return null;
+            @memcpy(ip_buf[0..ipv6_str.len], ipv6_str);
+            ip_buf[ipv6_str.len] = 0;
+            const ip_z: [:0]const u8 = ip_buf[0..ipv6_str.len :0];
+
+            return net.Address.parseIp6(ip_z, port) catch return null;
+        }
+        return null;
+    }
+
+    // IPv4 格式 IP:port
+    if (std.mem.lastIndexOf(u8, endpoint_str, ":")) |colon_pos| {
+        const ip_str = endpoint_str[0..colon_pos];
+        const port_str = endpoint_str[colon_pos + 1 ..];
+
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+
+        // 创建 null-terminated 字符串
+        var ip_buf: [64]u8 = undefined;
+        if (ip_str.len >= ip_buf.len) return null;
+        @memcpy(ip_buf[0..ip_str.len], ip_str);
+        ip_buf[ip_str.len] = 0;
+        const ip_z: [:0]const u8 = ip_buf[0..ip_str.len :0];
+
+        return net.Address.parseIp4(ip_z, port) catch return null;
+    }
+
+    return null;
+}
+
+test "parseEndpointString" {
+    // 测试 IPv4
+    if (parseEndpointString("192.168.1.1:8080")) |addr| {
+        try std.testing.expectEqual(@as(u16, 8080), getPort(addr));
+        try std.testing.expect(isIPv4(addr));
+    } else {
+        try std.testing.expect(false);
+    }
+
+    // 测试 IPv6
+    if (parseEndpointString("[::1]:443")) |addr| {
+        try std.testing.expectEqual(@as(u16, 443), getPort(addr));
+        try std.testing.expect(isIPv6(addr));
+    } else {
+        try std.testing.expect(false);
+    }
+
+    // 测试无效格式
+    try std.testing.expect(parseEndpointString("") == null);
+    try std.testing.expect(parseEndpointString("192.168.1.1") == null);
+    try std.testing.expect(parseEndpointString("invalid") == null);
 }
 
 // ============ DNS 解析 ============
