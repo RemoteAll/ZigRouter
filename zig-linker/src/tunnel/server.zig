@@ -196,6 +196,9 @@ pub const PunchServer = struct {
         // 设置 UDP socket 选项
         try net_utils.setReuseAddr(udp_sock, true);
 
+        // Windows UDP bug 修复 - 防止 ICMP port unreachable 导致后续 recvfrom 失败
+        net_utils.windowsUdpBugFix(udp_sock);
+
         // 绑定 UDP 到同一端口
         try posix.bind(udp_sock, &listen_addr.any, listen_addr.getOsSockLen());
 
@@ -280,7 +283,9 @@ pub const PunchServer = struct {
             };
 
             const client_ep = net.Address{ .any = client_addr };
-            log.info("新连接: {any}", .{client_ep});
+            var client_addr_buf: [64]u8 = undefined;
+            const client_addr_str = ClientInfo.formatAddress(client_ep, &client_addr_buf);
+            log.info("新 TCP 连接: {s}", .{client_addr_str});
 
             // 在新线程中处理客户端
             const thread = std.Thread.spawn(.{}, handleClientThread, .{ self, client_sock, client_ep }) catch |e| {
@@ -324,10 +329,10 @@ pub const PunchServer = struct {
 
             const client_ep = net.Address{ .any = src_addr };
 
-            // 记录调试信息
+            // 记录调试信息 - 使用 info 级别确保可见
             var addr_buf: [64]u8 = undefined;
             const addr_str = ClientInfo.formatAddress(client_ep, &addr_buf);
-            log.debug("收到 UDP 地址探测请求: {s}", .{addr_str});
+            log.info("收到 UDP 地址探测请求，来源: {s}", .{addr_str});
 
             // 构建响应：返回客户端的公网地址
             var response: [128]u8 = undefined;
@@ -339,7 +344,7 @@ pub const PunchServer = struct {
                 continue;
             };
 
-            log.debug("已发送公网地址响应: {s}", .{addr_str});
+            log.info("已发送公网地址响应给: {s}, 响应长度: {d} 字节", .{ addr_str, resp_len });
         }
 
         log.info("UDP 地址探测服务已停止", .{});
@@ -538,7 +543,7 @@ pub const PunchServer = struct {
         // 打印所有在线客户端列表
         self.printOnlineClients();
 
-        // 发送注册成功响应（使用新注册的客户端信息）
+        // 发送注册成功响应（使用新注册的客户信息）
         try self.sendRegisterResponseToClient(&client_info);
 
         // 广播新客户端上线通知给其他客户端
@@ -546,7 +551,10 @@ pub const PunchServer = struct {
 
         // 进入消息处理循环
         self.handleClientMessagesWithTls(client_info.machine_id) catch |e| {
-            log.err("客户端消息处理错误: {any}", .{e});
+            // ConnectionClosed 是客户端主动断开，不算错误
+            if (e != error.ConnectionClosed) {
+                log.err("客户端消息处理错误: {any}", .{e});
+            }
         };
 
         // 广播客户端下线通知

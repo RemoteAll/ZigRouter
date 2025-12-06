@@ -308,6 +308,22 @@ pub const TransportUdp = struct {
         const sock = try net_utils.createReuseUdpSocket(info.local.local);
         errdefer posix.close(sock);
 
+        // 打印本地绑定地址
+        var local_sockaddr: posix.sockaddr = undefined;
+        var local_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        if (posix.getsockname(sock, &local_sockaddr, &local_len)) |_| {
+            const bound_addr = net.Address{ .any = local_sockaddr };
+            const bound_str = log.formatAddress(bound_addr);
+            log.info("UDP 正向连接: 本地绑定地址 {s}", .{std.mem.sliceTo(&bound_str, 0)});
+        } else |_| {}
+
+        // 打印目标端点
+        log.info("UDP 正向连接: 目标端点数量 {d}", .{info.remote_endpoints.len});
+        for (info.remote_endpoints, 0..) |ep, i| {
+            const ep_str = log.formatAddress(ep);
+            log.info("UDP 正向连接:   [{d}] {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+        }
+
         // 设置接收超时
         try net_utils.setRecvTimeout(sock, self.config.auth_timeout_ms);
 
@@ -389,11 +405,29 @@ pub const TransportUdp = struct {
         const sock = try net_utils.createReuseUdpSocket(info.local.local);
         errdefer posix.close(sock);
 
+        // 打印本地绑定地址
+        var local_sockaddr: posix.sockaddr = undefined;
+        var local_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        if (posix.getsockname(sock, &local_sockaddr, &local_len)) |_| {
+            const bound_addr = net.Address{ .any = local_sockaddr };
+            const bound_str = log.formatAddress(bound_addr);
+            log.info("UDP 反向连接: 本地绑定地址 {s}", .{std.mem.sliceTo(&bound_str, 0)});
+        } else |_| {}
+
+        // 打印目标端点
+        log.info("UDP 反向连接: 目标端点数量 {d}", .{info.remote_endpoints.len});
+        for (info.remote_endpoints, 0..) |ep, i| {
+            const ep_str = log.formatAddress(ep);
+            log.info("UDP 反向连接:   [{d}] {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+        }
+
         // 发送 TTL 包 (低 TTL，用于打开 NAT 映射)
+        log.info("UDP 反向连接: 发送 TTL 包打开 NAT 映射...", .{});
         self.sendTtlPackets(info, sock);
 
         // 设置接收超时
         try net_utils.setRecvTimeout(sock, self.config.connect_timeout_ms);
+        log.info("UDP 反向连接: 等待对方连接 (超时: {d}ms)...", .{self.config.connect_timeout_ms});
 
         // 等待对方消息
         var recv_buf: [1024]u8 = undefined;
@@ -590,7 +624,7 @@ pub const TransportUdpP2PNAT = struct {
     /// 执行同时打开连接
     /// 双方同时向对方发送 UDP 包，利用 NAT 的映射特性完成穿透
     fn connectForward(self: *Self, info: *const types.TunnelTransportInfo, mode: types.TunnelMode) !?ITunnelConnection {
-        log.debug("UDP P2PNAT 连接开始, 模式: {s}", .{mode.toString()});
+        log.info("UDP P2PNAT 连接开始, 模式: {s}", .{mode.toString()});
 
         if (info.remote_endpoints.len == 0) {
             log.logPunchFailed(.udp_p2p_nat, "没有可用的远程端点");
@@ -601,10 +635,27 @@ pub const TransportUdpP2PNAT = struct {
         const sock = try net_utils.createReuseUdpSocket(info.local.local);
         errdefer posix.close(sock);
 
+        // 打印本地绑定地址
+        var local_sockaddr: posix.sockaddr = undefined;
+        var local_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        if (posix.getsockname(sock, &local_sockaddr, &local_len)) |_| {
+            const bound_addr = net.Address{ .any = local_sockaddr };
+            const bound_str = log.formatAddress(bound_addr);
+            log.info("UDP P2PNAT: 本地绑定地址 {s}", .{std.mem.sliceTo(&bound_str, 0)});
+        } else |_| {}
+
+        // 打印目标端点
+        log.info("UDP P2PNAT: 目标端点数量 {d}", .{info.remote_endpoints.len});
+        for (info.remote_endpoints, 0..) |ep, i| {
+            const ep_str = log.formatAddress(ep);
+            log.info("UDP P2PNAT:   [{d}] {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+        }
+
         // 设置接收超时
         try net_utils.setRecvTimeout(sock, self.config.connect_timeout_ms);
 
         // 等待 500ms 让双方都准备好
+        log.info("UDP P2PNAT: 等待 500ms 让双方准备好...", .{});
         std.Thread.sleep(500 * std.time.ns_per_ms);
 
         var recv_buf: [1024]u8 = undefined;

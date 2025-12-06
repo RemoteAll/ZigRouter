@@ -116,8 +116,12 @@ pub const PunchClient = struct {
     /// 本机公网地址
     public_addr: ?net.Address = null,
 
-    /// 本机本地地址
+    /// 本机本地地址（TCP 连接地址）
     local_addr: ?net.Address = null,
+
+    /// UDP 打洞本地地址（用于 NAT 打洞）
+    /// 这是通过 UDP 探测时获取的本地地址，端口与 NAT 映射对应
+    udp_local_addr: ?net.Address = null,
 
     /// 是否已注册
     registered: bool = false,
@@ -253,27 +257,38 @@ pub const PunchClient = struct {
         if (self.getExternalAddrFromLinker()) |result| {
             self.local_nat_type = result.nat_type;
             self.public_addr = result.public_addr;
+            // 保存 UDP 本地地址，用于后续打洞
+            // 这是关键：打洞时必须使用这个端口，而不是 TCP 连接的端口
+            self.udp_local_addr = result.local_addr;
             log.info("通过 Linker 服务端获取公网地址成功", .{});
+            var udp_addr_buf: [64]u8 = undefined;
+            const udp_addr_str = formatAddress(result.local_addr, &udp_addr_buf);
+            log.info("UDP 打洞本地端口: {s}", .{udp_addr_str});
             log.logNatDetection(
                 result.nat_type,
-                self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                result.local_addr, // 使用 UDP 本地地址而不是 TCP 地址
                 result.public_addr,
             );
             return;
         } else |e| {
             log.warn("Linker UDP 探测失败: {any}，使用默认 NAT 类型", .{e});
             self.local_nat_type = .unknown;
+            // UDP 探测失败时，使用 TCP 地址作为备选
+            self.udp_local_addr = self.local_addr;
         }
     }
 
     /// 通过 Linker 服务端 UDP 获取公网地址
-    /// 返回公网地址和 NAT 类型
+    /// 返回公网地址、本地 UDP 地址和 NAT 类型
     const LinkerExternalResult = struct {
         public_addr: ?net.Address,
+        local_addr: net.Address, // UDP socket 的本地地址（包含正确的打洞端口）
         nat_type: types.NatType,
     };
 
     fn getExternalAddrFromLinker(self: *Self) !LinkerExternalResult {
+        log.debug("开始 UDP 探测，服务器: {s}:{d}", .{ self.config.server_addr, self.config.server_port });
+
         // 创建 UDP socket
         const udp_sock = try posix.socket(
             posix.AF.INET,
@@ -282,12 +297,24 @@ pub const PunchClient = struct {
         );
         defer posix.close(udp_sock);
 
-        // 设置超时
-        const timeout = posix.timeval{
-            .sec = 2,
-            .usec = 0,
-        };
-        try posix.setsockopt(udp_sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        // Windows UDP bug 修复
+        net_utils.windowsUdpBugFix(udp_sock);
+
+        // 设置超时 - Windows 使用毫秒
+        if (@import("builtin").os.tag == .windows) {
+            const timeout_ms: i32 = 2000; // 2秒
+            posix.setsockopt(udp_sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms)) catch |e| {
+                log.warn("设置 UDP 超时失败: {any}", .{e});
+            };
+        } else {
+            const timeout = posix.timeval{
+                .sec = 2,
+                .usec = 0,
+            };
+            posix.setsockopt(udp_sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |e| {
+                log.warn("设置 UDP 超时失败: {any}", .{e});
+            };
+        }
 
         // 绑定本地地址
         const local_bind = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
@@ -295,6 +322,8 @@ pub const PunchClient = struct {
 
         // 服务器地址
         const server_addr = try net.Address.parseIp4(self.config.server_addr, self.config.server_port);
+        var server_addr_buf: [64]u8 = undefined;
+        log.debug("UDP 探测目标: {s}", .{formatAddress(server_addr, &server_addr_buf)});
 
         // 构建探测请求：[0x00][序号][随机数据]
         var request: [64]u8 = undefined;
@@ -308,57 +337,100 @@ pub const PunchClient = struct {
             request[i] = random.int(u8);
         }
 
-        // 发送请求
-        _ = try posix.sendto(udp_sock, &request, 0, &server_addr.any, server_addr.getOsSockLen());
+        // 多次重试发送请求
+        var retry: u32 = 0;
+        while (retry < 3) : (retry += 1) {
+            log.debug("UDP 探测发送请求 ({d}/3)...", .{retry + 1});
+            _ = posix.sendto(udp_sock, &request, 0, &server_addr.any, server_addr.getOsSockLen()) catch |e| {
+                log.warn("UDP 探测发送失败: {any}", .{e});
+                continue;
+            };
 
-        // 接收响应
-        var response: [128]u8 = undefined;
-        var src_addr: posix.sockaddr = undefined;
-        var src_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+            // 接收响应
+            var response: [128]u8 = undefined;
+            var src_addr: posix.sockaddr = undefined;
+            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
-        const recv_len = posix.recvfrom(udp_sock, &response, 0, &src_addr, &src_len) catch |e| {
-            return e;
-        };
+            const recv_len = posix.recvfrom(udp_sock, &response, 0, &src_addr, &src_len) catch |e| {
+                if (e == error.WouldBlock or e == error.ConnectionTimedOut) {
+                    log.debug("UDP 探测等待响应超时，重试...", .{});
+                    continue;
+                }
+                log.warn("UDP 探测接收失败: {any}", .{e});
+                continue;
+            };
 
-        if (recv_len < 7) {
-            return error.InvalidResponse;
-        }
-
-        // 解析响应（数据已与 0xFF 异或）
-        for (0..recv_len) |i| {
-            response[i] = response[i] ^ 0xFF;
-        }
-
-        // 解析地址族
-        const family: u16 = response[0];
-        var public_addr: net.Address = undefined;
-
-        if (family == posix.AF.INET) {
-            // IPv4: [family(1)][ip(4)][port(2)]
-            const ip_bytes = response[1..5];
-            const port_bytes = response[5..7];
-            const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
-
-            public_addr = net.Address.initIp4(ip_bytes[0..4].*, port);
-        } else if (family == posix.AF.INET6) {
-            // IPv6: [family(1)][ip(16)][port(2)]
-            if (recv_len < 19) {
-                return error.InvalidResponse;
+            if (recv_len < 7) {
+                log.warn("UDP 探测响应长度不足: {d}", .{recv_len});
+                continue;
             }
-            const port_bytes = response[17..19];
-            const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
 
-            public_addr = net.Address.initIp6(response[1..17].*, port, 0, 0);
-        } else {
-            return error.UnsupportedAddressFamily;
+            log.debug("UDP 探测收到响应，长度: {d}", .{recv_len});
+
+            // 解析响应（数据已与 0xFF 异或）
+            for (0..recv_len) |i| {
+                response[i] = response[i] ^ 0xFF;
+            }
+
+            // 解析地址族
+            const family: u16 = response[0];
+            var public_addr: net.Address = undefined;
+
+            if (family == posix.AF.INET) {
+                // IPv4: [family(1)][ip(4)][port(2)]
+                const ip_bytes = response[1..5];
+                const port_bytes = response[5..7];
+                const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
+
+                public_addr = net.Address.initIp4(ip_bytes[0..4].*, port);
+            } else if (family == posix.AF.INET6) {
+                // IPv6: [family(1)][ip(16)][port(2)]
+                if (recv_len < 19) {
+                    log.warn("IPv6 响应长度不足", .{});
+                    continue;
+                }
+                const port_bytes = response[17..19];
+                const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
+
+                public_addr = net.Address.initIp6(response[1..17].*, port, 0, 0);
+            } else {
+                log.warn("不支持的地址族: {d}", .{family});
+                continue;
+            }
+
+            // 获取 UDP socket 的本地地址（包含系统分配的端口）
+            var local_sockaddr: posix.sockaddr = undefined;
+            var local_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+            try posix.getsockname(udp_sock, &local_sockaddr, &local_len);
+            var local_udp_addr = net.Address{ .any = local_sockaddr };
+
+            // 关键修复：getsockname 返回的 IP 是 0.0.0.0（因为绑定的是通配符地址）
+            // 需要获取实际的本机出口 IP，并结合 UDP 端口
+            if (net_utils.getLocalOutboundAddress()) |outbound_addr| {
+                const udp_port = local_udp_addr.getPort();
+                local_udp_addr = net.Address.initIp4(
+                    @as(*const [4]u8, @ptrCast(&outbound_addr.in.sa.addr)).*,
+                    udp_port,
+                );
+            }
+
+            var local_addr_buf: [64]u8 = undefined;
+            var public_addr_buf: [64]u8 = undefined;
+            log.info("UDP 探测成功! 本地: {s}, 公网: {s}", .{
+                formatAddress(local_udp_addr, &local_addr_buf),
+                formatAddress(public_addr, &public_addr_buf),
+            });
+
+            return LinkerExternalResult{
+                .public_addr = public_addr,
+                .local_addr = local_udp_addr,
+                .nat_type = .unknown,
+            };
         }
 
-        // 简单判断 NAT 类型（后续可以通过多次探测细化）
-        // 如果能收到响应，至少说明 NAT 是可穿透的
-        return LinkerExternalResult{
-            .public_addr = public_addr,
-            .nat_type = .unknown, // 需要更多探测才能确定具体类型
-        };
+        // 所有重试都失败
+        log.warn("UDP 探测失败：服务端可能未开启 UDP 端口 {d}", .{self.config.server_port});
+        return error.ConnectionTimedOut;
     }
 
     /// 注册到服务器
@@ -366,11 +438,14 @@ pub const PunchClient = struct {
         const sock = self.server_socket orelse return error.NotConnected;
 
         // 构造注册消息
+        // 关键：local_endpoint 必须使用 UDP 探测时的本地地址，因为打洞时需要使用相同的端口
+        // 否则当两个客户端在同一台机器上时，它们会使用 TCP 端口进行 UDP 打洞，导致失败
         const peer_info = protocol.PeerInfo{
             .machine_id = if (self.config.machine_id.len > 0) self.config.machine_id else self.generateMachineId(),
             .machine_name = if (self.config.machine_name.len > 0) self.config.machine_name else "zig-client",
             .nat_type = self.local_nat_type,
-            .local_endpoint = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+            // 使用 UDP 本地地址进行注册，这样服务器会告诉对方正确的打洞端口
+            .local_endpoint = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
             .public_endpoint = null,
             .supported_transports = &[_]types.TransportType{},
             .port_map_wan = self.config.port_map_wan,
@@ -721,7 +796,8 @@ pub const PunchClient = struct {
                 .machine_id = self.assigned_id,
                 .machine_name = self.config.machine_name,
                 .nat_type = self.local_nat_type,
-                .local = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                // 关键：使用 UDP 本地地址进行打洞，确保端口与 NAT 映射匹配
+                .local = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
                 .remote = self.public_addr,
                 .port_map_wan = self.config.port_map_wan,
                 .route_level = 8,
@@ -793,7 +869,8 @@ pub const PunchClient = struct {
                 .machine_id = self.assigned_id,
                 .machine_name = self.config.machine_name,
                 .nat_type = self.local_nat_type,
-                .local = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                // 关键：使用 UDP 本地地址进行打洞，确保端口与 NAT 映射匹配
+                .local = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
                 .public = self.public_addr,
                 .port_map_wan = self.config.port_map_wan,
                 .route_level = 8,
@@ -1065,7 +1142,8 @@ pub const PunchClient = struct {
                             .machine_id = self.assigned_id,
                             .machine_name = self.config.machine_name,
                             .nat_type = self.local_nat_type,
-                            .local = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                            // 关键：使用 UDP 本地地址进行打洞，确保端口与 NAT 映射匹配
+                            .local = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
                             .local_ips = &.{},
                             .remote = self.public_addr,
                             .port_map_wan = self.config.port_map_wan,
@@ -1350,7 +1428,8 @@ pub const PunchClient = struct {
 
         // 构建传输信息
         const local_info = types.EndpointInfo{
-            .local = self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+            // 关键：使用 UDP 本地地址进行打洞，确保端口与 NAT 映射匹配
+            .local = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
             .local_ips = &.{},
             .machine_id = self.assigned_id,
             .machine_name = self.config.machine_name,
