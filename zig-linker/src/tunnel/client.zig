@@ -156,11 +156,18 @@ pub const PunchClient = struct {
     /// NAT 类型检测完成回调
     on_nat_type_detected: ?*const fn (*Self, types.NatType) void = null,
 
+    /// 已建立的隧道连接池 (machine_id -> connection)
+    active_connections: std.StringHashMap(transport_mod.ITunnelConnection) = undefined,
+
+    /// 连接池互斥锁
+    connections_mutex: std.Thread.Mutex = .{},
+
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Self {
         return Self{
             .allocator = allocator,
             .config = config,
             .transport_manager = transport_mod.TransportManager.init(allocator, .{}),
+            .active_connections = std.StringHashMap(transport_mod.ITunnelConnection).init(allocator),
         };
     }
 
@@ -172,11 +179,71 @@ pub const PunchClient = struct {
             self.nat_detect_thread = null;
         }
 
+        // 关闭所有活跃连接
+        self.closeAllConnections();
+        self.active_connections.deinit();
+
         self.disconnect();
         self.transport_manager.deinit();
         if (self.assigned_id.len > 0) {
             self.allocator.free(self.assigned_id);
         }
+    }
+
+    /// 关闭所有活跃连接
+    fn closeAllConnections(self: *Self) void {
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+
+        var it = self.active_connections.iterator();
+        while (it.next()) |entry| {
+            var conn = entry.value_ptr;
+            conn.close();
+            // 释放 machine_id 字符串
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.active_connections.clearRetainingCapacity();
+        log.debug("已关闭所有活跃连接", .{});
+    }
+
+    /// 关闭与指定节点的连接
+    fn closeConnectionByMachineId(self: *Self, machine_id: []const u8) void {
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+
+        if (self.active_connections.fetchRemove(machine_id)) |kv| {
+            var conn = kv.value;
+            conn.close();
+            // 释放 machine_id 字符串
+            self.allocator.free(kv.key);
+            log.info("已关闭与 {s} 的连接", .{machine_id});
+        }
+    }
+
+    /// 保存连接到连接池
+    fn saveConnection(self: *Self, machine_id: []const u8, conn: transport_mod.ITunnelConnection) void {
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+
+        // 如果已有连接，先关闭旧连接
+        if (self.active_connections.fetchRemove(machine_id)) |kv| {
+            var old_conn = kv.value;
+            old_conn.close();
+            self.allocator.free(kv.key);
+            log.debug("关闭与 {s} 的旧连接", .{machine_id});
+        }
+
+        // 复制 machine_id 并存储
+        const id_copy = self.allocator.dupe(u8, machine_id) catch {
+            log.err("保存连接失败: 内存分配失败", .{});
+            return;
+        };
+        self.active_connections.put(id_copy, conn) catch {
+            self.allocator.free(id_copy);
+            log.err("保存连接失败: HashMap 错误", .{});
+            return;
+        };
+        log.debug("已保存与 {s} 的连接", .{machine_id});
     }
 
     /// 连接到信令服务器
@@ -1439,7 +1506,8 @@ pub const PunchClient = struct {
                         }
 
                         log.info("隧道连接已建立，保持活跃状态", .{});
-                        // TODO: 将 connection 保存到连接池中供后续使用
+                        // 将连接保存到连接池
+                        self.saveConnection(begin.source_machine_id, mutable_conn);
                     } else {
                         log.err("========== 打洞失败 ==========", .{});
                         log.err("传输方式: {s}", .{begin.transport.description()});
@@ -1481,6 +1549,9 @@ pub const PunchClient = struct {
                     log.info("┌──────────────────────────────────────────────────────────────┐", .{});
                     log.info("│ 节点下线: {s}", .{peer_info.machine_id});
                     log.info("└──────────────────────────────────────────────────────────────┘", .{});
+
+                    // 关闭与该节点的连接，释放资源
+                    self.closeConnectionByMachineId(peer_info.machine_id);
 
                     // 调用回调
                     if (self.on_peer_offline) |callback| {

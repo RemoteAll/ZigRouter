@@ -305,8 +305,24 @@ pub const TransportUdp = struct {
         log.debug("UDP 正向连接开始", .{});
 
         // 创建 UDP socket
-        const sock = try net_utils.createReuseUdpSocket(info.local.local);
+        // 判断是否是内网直连：如果第一个目标端点是内网地址，则使用注册时的端口
+        // 内网直连必须使用固定端口，否则对方不知道从哪个端口接收
+        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
+        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
+
+        const local_ip = info.local.local;
+        const bind_addr = net.Address.initIp4(
+            @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
+            bind_port,
+        );
+        const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
+
+        if (is_lan) {
+            log.debug("UDP 正向连接: 内网直连，使用固定端口 {d}", .{bind_port});
+        } else {
+            log.debug("UDP 正向连接: 公网打洞，使用动态端口", .{});
+        }
 
         // 打印本地绑定地址
         var local_sockaddr: posix.sockaddr = undefined;
@@ -401,9 +417,24 @@ pub const TransportUdp = struct {
     fn connectReverse(self: *Self, info: *const types.TunnelTransportInfo) !?ITunnelConnection {
         log.debug("UDP 反向连接开始", .{});
 
-        // 创建 UDP socket 并监听
-        const sock = try net_utils.createReuseUdpSocket(info.local.local);
+        // 创建 UDP socket
+        // 内网直连必须使用固定端口，否则对方不知道从哪个端口接收
+        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
+        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
+
+        const local_ip = info.local.local;
+        const bind_addr = net.Address.initIp4(
+            @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
+            bind_port,
+        );
+        const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
+
+        if (is_lan) {
+            log.debug("UDP 反向连接: 内网直连，使用固定端口 {d}", .{bind_port});
+        } else {
+            log.debug("UDP 反向连接: 公网打洞，使用动态端口", .{});
+        }
 
         // 打印本地绑定地址
         var local_sockaddr: posix.sockaddr = undefined;
@@ -631,8 +662,17 @@ pub const TransportUdpP2PNAT = struct {
             return null;
         }
 
-        // 创建 UDP socket 并绑定到本地端口
-        const sock = try net_utils.createReuseUdpSocket(info.local.local);
+        // 创建 UDP socket
+        // 内网直连使用固定端口，公网打洞使用动态端口
+        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
+        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
+
+        const local_ip = info.local.local;
+        const bind_addr = net.Address.initIp4(
+            @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
+            bind_port,
+        );
+        const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
 
         // 打印本地绑定地址
@@ -1111,7 +1151,17 @@ pub const TransportUdpPortMap = struct {
         _ = self;
         log.debug("UDP 端口映射正向连接", .{});
 
-        const sock = try net_utils.createReuseUdpSocket(info.local.local);
+        // 创建 UDP socket
+        // 端口映射通常是公网场景，但也可能是内网，根据目标地址判断
+        const is_lan = if (info.remote_endpoints.len > 0) net_utils.isPrivateAddress(info.remote_endpoints[0]) else false;
+        const bind_port: u16 = if (is_lan) info.local.local.getPort() else 0;
+
+        const local_ip = info.local.local;
+        const bind_addr = net.Address.initIp4(
+            @as(*const [4]u8, @ptrCast(&local_ip.in.sa.addr)).*,
+            bind_port,
+        );
+        const sock = try net_utils.createReuseUdpSocket(bind_addr);
         errdefer posix.close(sock);
 
         // 构造目标地址 (使用端口映射端口)
