@@ -807,9 +807,26 @@ pub const TransportTcpP2PNAT = struct {
     callbacks: TransportCallbacks,
 
     pub const Config = struct {
+        /// 单次连接超时 (毫秒) - 与 C# 保持一致 500ms
         connect_timeout_ms: u32 = 500,
+        /// 重试次数 - 与 C# 保持一致 5 次
         retry_count: u32 = 5,
         ssl: bool = false,
+    };
+
+    /// 并行连接结果
+    const ConnectResult = struct {
+        success: bool,
+        sock: ?posix.socket_t,
+        endpoint: net.Address,
+    };
+
+    /// 并行连接线程上下文
+    const ConnectThreadContext = struct {
+        endpoint: net.Address,
+        local_port: u16,
+        timeout_ms: u32,
+        result: *ConnectResult,
     };
 
     pub fn init(cfg: Config, callbacks: TransportCallbacks) Self {
@@ -830,13 +847,29 @@ pub const TransportTcpP2PNAT = struct {
     fn connectForward(self: *Self, info: *const types.TunnelTransportInfo, mode: types.TunnelMode) !?ITunnelConnection {
         log.debug("TCP P2PNAT 连接开始, 模式: {s}", .{mode.toString()});
 
+        // TCP P2P NAT 原理：
+        // 1. 双方都 bind() 到各自本地端口
+        // 2. 双方都同时 connect() 对方端口
+        // 3. 当两边的 SYN 包在 NAT/网络中"交叉"时，TCP 协议栈会识别这是 Simultaneous Open
+        // 4. 双方都会收到对方的 SYN，然后都发 SYN+ACK，连接建立
+        // 注意：不需要 listen()！依赖的是两边同时发起 connect()
+
+        const local_port = info.local.local.getPort();
+        log.info("TCP P2PNAT: 使用本地端口 {d}，目标端点数量: {d}", .{ local_port, info.remote_endpoints.len });
+
+        for (info.remote_endpoints, 0..) |ep, i| {
+            const ep_str = log.formatAddress(ep);
+            log.info("TCP P2PNAT:   [{d}] {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+        }
+
+        // 重试循环（与 C# 的 5 次重试保持一致）
         var retry: u32 = 0;
         while (retry < self.config.retry_count) : (retry += 1) {
-            // 尝试连接所有端点
-            for (info.remote_endpoints) |ep| {
-                if (try self.tryConnect(info, ep, mode)) |conn| {
-                    return conn;
-                }
+            log.info("TCP P2PNAT: 尝试连接 ({d}/{d})...", .{ retry + 1, self.config.retry_count });
+
+            // 并行连接所有端点（与 C# 的 Task.WhenAll 一致）
+            if (try self.tryConnectAllEndpointsParallel(info, local_port, mode)) |conn| {
+                return conn;
             }
         }
 
@@ -844,40 +877,213 @@ pub const TransportTcpP2PNAT = struct {
         return null;
     }
 
-    fn tryConnect(self: *Self, info: *const types.TunnelTransportInfo, ep: net.Address, mode: types.TunnelMode) !?ITunnelConnection {
-        _ = self;
-        log.logConnectAttempt(ep, 1);
+    /// 并行连接所有端点
+    fn tryConnectAllEndpointsParallel(self: *Self, info: *const types.TunnelTransportInfo, local_port: u16, mode: types.TunnelMode) !?ITunnelConnection {
+        const endpoint_count = info.remote_endpoints.len;
+        if (endpoint_count == 0) return null;
 
-        // 创建 TCP socket
-        const sock = try net_utils.createReuseTcpSocket(info.local.local);
-        errdefer posix.close(sock);
+        // 为每个端点准备结果和线程
+        var results: [8]ConnectResult = undefined;
+        var threads: [8]?std.Thread = [_]?std.Thread{null} ** 8;
+        var contexts: [8]ConnectThreadContext = undefined;
+
+        const actual_count = @min(endpoint_count, 8);
+
+        // 启动所有连接线程
+        for (0..actual_count) |i| {
+            results[i] = .{
+                .success = false,
+                .sock = null,
+                .endpoint = info.remote_endpoints[i],
+            };
+            contexts[i] = .{
+                .endpoint = info.remote_endpoints[i],
+                .local_port = local_port,
+                .timeout_ms = self.config.connect_timeout_ms,
+                .result = &results[i],
+            };
+
+            threads[i] = std.Thread.spawn(.{}, connectThreadFn, .{&contexts[i]}) catch null;
+        }
+
+        // 等待所有线程完成
+        for (0..actual_count) |i| {
+            if (threads[i]) |t| {
+                t.join();
+            }
+        }
+
+        // 检查结果，找到第一个成功的连接
+        var success_sock: ?posix.socket_t = null;
+        var success_ep: ?net.Address = null;
+
+        for (0..actual_count) |i| {
+            if (results[i].success) {
+                if (success_sock == null) {
+                    success_sock = results[i].sock;
+                    success_ep = results[i].endpoint;
+                } else {
+                    // 关闭多余的成功连接
+                    if (results[i].sock) |s| {
+                        posix.close(s);
+                    }
+                }
+            }
+        }
+
+        if (success_sock) |sock| {
+            // 有一个连接成功，进行认证
+            return try self.authenticateConnection(sock, success_ep.?, info, mode);
+        }
+
+        return null;
+    }
+
+    /// 连接线程函数
+    fn connectThreadFn(ctx: *ConnectThreadContext) void {
+        const sock = tryConnectSingle(ctx.endpoint, ctx.local_port, ctx.timeout_ms);
+        if (sock) |s| {
+            ctx.result.success = true;
+            ctx.result.sock = s;
+        }
+    }
+
+    /// 单个端点的连接尝试（静态函数，供线程调用）
+    fn tryConnectSingle(ep: net.Address, local_port: u16, timeout_ms: u32) ?posix.socket_t {
+        const family = ep.any.family;
+        const sock = posix.socket(family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch {
+            return null;
+        };
+
+        // 设置端口复用（必须在 bind 之前）
+        net_utils.setReuseAddr(sock, true) catch {};
+        net_utils.setReusePort(sock, true) catch {};
+
+        // 绑定到与 UDP 相同的本地端口
+        const bind_addr = if (family == posix.AF.INET)
+            net.Address.initIp4(.{ 0, 0, 0, 0 }, local_port)
+        else
+            net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, local_port, 0, 0);
+
+        posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen()) catch {
+            posix.close(sock);
+            return null;
+        };
 
         // 设置 Keep-Alive
         net_utils.setKeepAlive(sock, true) catch {};
 
-        // 尝试连接
-        posix.connect(sock, &ep.any, ep.getOsSockLen()) catch |e| {
-            log.debug("TCP 连接失败: {any}", .{e});
+        // 设置为非阻塞模式
+        net_utils.setNonBlocking(sock, true) catch {
+            posix.close(sock);
             return null;
         };
+
+        // 尝试非阻塞连接
+        const connect_result = posix.connect(sock, &ep.any, ep.getOsSockLen());
+        if (connect_result) |_| {
+            // 立即成功
+            net_utils.setNonBlocking(sock, false) catch {};
+            return sock;
+        } else |e| {
+            if (e != error.WouldBlock) {
+                posix.close(sock);
+                return null;
+            }
+        }
+
+        // 使用 poll 等待连接完成
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = sock,
+            .events = posix.POLL.OUT,
+            .revents = 0,
+        }};
+
+        const poll_result = posix.poll(&poll_fds, @intCast(timeout_ms)) catch {
+            posix.close(sock);
+            return null;
+        };
+
+        if (poll_result == 0) {
+            posix.close(sock);
+            return null;
+        }
+
+        // 检查连接是否成功
+        if (poll_fds[0].revents & posix.POLL.ERR != 0 or poll_fds[0].revents & posix.POLL.HUP != 0) {
+            posix.close(sock);
+            return null;
+        }
+
+        // 获取 socket 错误状态
+        var sock_err: c_int = 0;
+        posix.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&sock_err)) catch {
+            posix.close(sock);
+            return null;
+        };
+
+        if (sock_err != 0) {
+            posix.close(sock);
+            return null;
+        }
+
+        // 恢复为阻塞模式
+        net_utils.setNonBlocking(sock, false) catch {};
+
+        return sock;
+    }
+
+    /// 认证已建立的连接
+    fn authenticateConnection(self: *Self, sock: posix.socket_t, ep: net.Address, info: *const types.TunnelTransportInfo, mode: types.TunnelMode) !?ITunnelConnection {
+        _ = self;
+
+        log.info("TCP P2PNAT: TCP 连接成功，开始认证...", .{});
+
+        // 设置收发超时
+        net_utils.setRecvTimeout(sock, 500) catch {};
+        net_utils.setSendTimeout(sock, 500) catch {};
 
         // 连接成功，进行认证
         if (mode == .client) {
             // 客户端：发送认证
-            _ = posix.send(sock, TCP_AUTH_BYTES, 0) catch return null;
+            _ = posix.send(sock, TCP_AUTH_BYTES, 0) catch |e| {
+                log.debug("TCP P2PNAT: 发送认证失败: {any}", .{e});
+                posix.close(sock);
+                return null;
+            };
 
             // 等待响应
             var buf: [64]u8 = undefined;
-            const recv_len = posix.recv(sock, &buf, 0) catch return null;
-            if (recv_len == 0) return null;
+            const recv_len = posix.recv(sock, &buf, 0) catch |e| {
+                log.debug("TCP P2PNAT: 接收响应失败: {any}", .{e});
+                posix.close(sock);
+                return null;
+            };
+            if (recv_len == 0) {
+                log.debug("TCP P2PNAT: 对方关闭连接", .{});
+                posix.close(sock);
+                return null;
+            }
         } else {
             // 服务端：等待认证
             var buf: [64]u8 = undefined;
-            const recv_len = posix.recv(sock, &buf, 0) catch return null;
-            if (recv_len == 0) return null;
+            const recv_len = posix.recv(sock, &buf, 0) catch |e| {
+                log.debug("TCP P2PNAT: 接收认证失败: {any}", .{e});
+                posix.close(sock);
+                return null;
+            };
+            if (recv_len == 0) {
+                log.debug("TCP P2PNAT: 对方关闭连接", .{});
+                posix.close(sock);
+                return null;
+            }
 
             // 发送响应
-            _ = posix.send(sock, TCP_END_BYTES, 0) catch return null;
+            _ = posix.send(sock, TCP_END_BYTES, 0) catch |e| {
+                log.debug("TCP P2PNAT: 发送响应失败: {any}", .{e});
+                posix.close(sock);
+                return null;
+            };
         }
 
         const remote_ep_converted = net_utils.convertMappedAddress(ep);

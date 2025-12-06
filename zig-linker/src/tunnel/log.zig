@@ -1,121 +1,64 @@
 //! 日志模块
 //! 提供详细的打洞过程日志，包含 NAT 类型、IP、端口等信息
+//! 使用 zzig 的 Logger 模块，支持自动时区转换和服务器时间同步
 
 const std = @import("std");
 const types = @import("types.zig");
+const zzig = @import("zzig");
 
-/// 日志级别
-pub const LogLevel = enum {
-    debug,
-    info,
-    warning,
-    err,
+/// 日志级别（兼容旧 API）
+pub const LogLevel = zzig.Logger.Level;
 
-    pub fn toString(self: LogLevel) []const u8 {
-        return switch (self) {
-            .debug => "DEBUG",
-            .info => "INFO",
-            .warning => "WARN",
-            .err => "ERROR",
-        };
-    }
-
-    pub fn color(self: LogLevel) []const u8 {
-        return switch (self) {
-            .debug => "\x1b[36m", // 青色
-            .info => "\x1b[32m", // 绿色
-            .warning => "\x1b[33m", // 黄色
-            .err => "\x1b[31m", // 红色
-        };
-    }
+/// 日志配置（兼容旧 API）
+pub const LogConfig = struct {
+    /// 最小日志级别
+    min_level: LogLevel = .debug,
 };
 
 /// 全局日志配置
 pub var config = LogConfig{};
 
-pub const LogConfig = struct {
-    /// 最小日志级别
-    min_level: LogLevel = .debug,
-    /// 是否启用颜色
-    use_color: bool = true,
-    /// 是否显示时间戳
-    show_timestamp: bool = true,
-    /// 是否显示源文件位置
-    show_source: bool = false,
-};
-
-/// 获取当前时间戳字符串
-fn getTimestamp(buf: []u8) []const u8 {
-    const timestamp = std.time.timestamp();
-    const epoch_seconds: u64 = @intCast(timestamp);
-    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_seconds };
-    const day_seconds = epoch.getDaySeconds();
-    const hours = day_seconds.getHoursIntoDay();
-    const minutes = day_seconds.getMinutesIntoHour();
-    const seconds = day_seconds.getSecondsIntoMinute();
-
-    const len = std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch return "??:??:??";
-    return buf[0..len.len];
+/// 设置日志级别
+pub fn setLevel(level: LogLevel) void {
+    config.min_level = level;
+    zzig.Logger.setLevel(level);
 }
 
-/// 日志写入器
-const LogWriter = struct {
-    const Self = @This();
+/// 设置服务器时间偏移量（毫秒）
+/// offset_ms: 服务器时间与本地时间的差值（毫秒）
+/// 设置后日志时间戳会使用校准后的时间
+pub fn setServerTimeOffset(offset_ms: i64) void {
+    zzig.Logger.setTimeOffset(offset_ms);
+}
 
-    pub fn log(
-        comptime level: LogLevel,
-        comptime src: std.builtin.SourceLocation,
-        comptime format: []const u8,
-        args: anytype,
-    ) void {
-        if (@intFromEnum(level) < @intFromEnum(config.min_level)) {
-            return;
-        }
+/// 获取服务器时间偏移量（毫秒）
+pub fn getServerTimeOffset() i64 {
+    return zzig.Logger.getTimeOffset();
+}
 
-        // 使用 std.debug.print 输出到 stderr
-        var ts_buf: [16]u8 = undefined;
-
-        // 时间戳
-        if (config.show_timestamp) {
-            const ts = getTimestamp(&ts_buf);
-            std.debug.print("[{s}] ", .{ts});
-        }
-
-        // 日志级别
-        if (config.use_color) {
-            std.debug.print("{s}[{s}]\x1b[0m ", .{ level.color(), level.toString() });
-        } else {
-            std.debug.print("[{s}] ", .{level.toString()});
-        }
-
-        // 源文件位置
-        if (config.show_source) {
-            std.debug.print("{s}:{d}: ", .{ src.file, src.line });
-        }
-
-        // 消息内容
-        std.debug.print(format ++ "\n", args);
-    }
-};
+/// 启用线程安全模式
+pub fn enableThreadSafe() void {
+    zzig.Logger.enableThreadSafe();
+}
 
 /// 调试日志
 pub fn debug(comptime format: []const u8, args: anytype) void {
-    LogWriter.log(.debug, @src(), format, args);
+    zzig.Logger.debug(format, args);
 }
 
 /// 信息日志
 pub fn info(comptime format: []const u8, args: anytype) void {
-    LogWriter.log(.info, @src(), format, args);
+    zzig.Logger.info(format, args);
 }
 
 /// 警告日志
 pub fn warn(comptime format: []const u8, args: anytype) void {
-    LogWriter.log(.warning, @src(), format, args);
+    zzig.Logger.warn(format, args);
 }
 
 /// 错误日志
 pub fn err(comptime format: []const u8, args: anytype) void {
-    LogWriter.log(.err, @src(), format, args);
+    zzig.Logger.err(format, args);
 }
 
 /// 格式化网络地址为可读字符串
@@ -236,17 +179,9 @@ pub fn logConnectAttempt(target: std.net.Address, attempt: u32) void {
     debug("尝试连接 -> {s} (第 {d} 次)", .{ std.mem.sliceTo(&addr_str, 0), attempt });
 }
 
-test "log functions" {
+test "log level" {
     // 测试日志级别
-    try std.testing.expectEqualStrings("DEBUG", LogLevel.debug.toString());
-    try std.testing.expectEqualStrings("ERROR", LogLevel.err.toString());
-}
-
-test "timestamp generation" {
-    var buf: [16]u8 = undefined;
-    const ts = getTimestamp(&buf);
-    // 时间戳格式应为 HH:MM:SS
-    try std.testing.expect(ts.len == 8);
-    try std.testing.expect(ts[2] == ':');
-    try std.testing.expect(ts[5] == ':');
+    try std.testing.expect(@intFromEnum(LogLevel.debug) < @intFromEnum(LogLevel.info));
+    try std.testing.expect(@intFromEnum(LogLevel.info) < @intFromEnum(LogLevel.warn));
+    try std.testing.expect(@intFromEnum(LogLevel.warn) < @intFromEnum(LogLevel.err));
 }

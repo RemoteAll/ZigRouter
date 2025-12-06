@@ -295,6 +295,30 @@ pub fn setTcpNoDelay(sock: posix.socket_t, enable: bool) SocketOptionError!void 
     };
 }
 
+/// 设置 Socket 为非阻塞模式（跨平台）
+pub fn setNonBlocking(sock: posix.socket_t, enable: bool) SocketOptionError!void {
+    if (builtin.os.tag == .windows) {
+        // Windows 使用 ioctlsocket + FIONBIO
+        const windows = std.os.windows;
+        var mode: c_ulong = if (enable) 1 else 0;
+        if (windows.ws2_32.ioctlsocket(sock, windows.ws2_32.FIONBIO, &mode) == windows.ws2_32.SOCKET_ERROR) {
+            return SocketOptionError.SetOptionFailed;
+        }
+    } else {
+        // POSIX 使用 fcntl + O_NONBLOCK
+        const current_flags = posix.fcntl(sock, posix.F.GETFL) catch {
+            return SocketOptionError.GetOptionFailed;
+        };
+        const new_flags = if (enable)
+            current_flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
+        else
+            current_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+        _ = posix.fcntl(sock, posix.F.SETFL, new_flags) catch {
+            return SocketOptionError.SetOptionFailed;
+        };
+    }
+}
+
 /// 设置发送缓冲区大小
 pub fn setSendBufferSize(sock: posix.socket_t, size: u32) SocketOptionError!void {
     const value: c_int = @intCast(size);

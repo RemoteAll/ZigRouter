@@ -616,17 +616,14 @@ pub const ConfigManager = struct {
     pub fn applyLogConfig(self: *Self) void {
         // 设置日志级别
         if (std.mem.eql(u8, self.config.log_level, "debug")) {
-            log.config.min_level = .debug;
+            log.setLevel(.debug);
         } else if (std.mem.eql(u8, self.config.log_level, "info")) {
-            log.config.min_level = .info;
+            log.setLevel(.info);
         } else if (std.mem.eql(u8, self.config.log_level, "warn")) {
-            log.config.min_level = .warning;
+            log.setLevel(.warn);
         } else if (std.mem.eql(u8, self.config.log_level, "error")) {
-            log.config.min_level = .err;
+            log.setLevel(.err);
         }
-
-        // 设置颜色
-        log.config.use_color = self.config.log_color;
     }
 };
 

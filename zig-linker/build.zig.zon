@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .zzig = .{
-            .url = "git+https://github.com/PeiKeSmart/zzig#b9fae6334d74e9e41bfbbb420aa83beebf2cad59",
-            .hash = "zzig-0.0.1-LGNHoWOGAwCvZecO0IoZ_2iOIuD4ygJXb_gIhLHXiK49",
+            .url = "git+https://github.com/PeiKeSmart/zzig#820a2a912b73e30bfc044161f5574ae49812bc53",
+            .hash = "zzig-0.0.1-LGNHoTaJAwBi9MEVB4cRsRmGiWOFDdrUBGs0cxveXE5i",
         },
     },
     .paths = .{

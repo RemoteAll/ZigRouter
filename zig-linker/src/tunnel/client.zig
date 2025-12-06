@@ -176,6 +176,14 @@ pub const PunchClient = struct {
     /// 待处理请求互斥锁
     pending_mutex: std.Thread.Mutex = .{},
 
+    /// 服务器时间偏移量（毫秒）
+    /// server_time = local_time + server_time_offset
+    /// 用于在多客户端之间同步时间，确保打洞时序一致
+    server_time_offset: i64 = 0,
+
+    /// 时间同步是否完成
+    time_synced: bool = false,
+
     /// 待处理打洞请求信息
     pub const PendingPunchRequest = struct {
         /// 目标机器 ID（已分配内存，需要释放）
@@ -290,6 +298,18 @@ pub const PunchClient = struct {
                 self.allocator.free(kv.key);
             }
         }
+    }
+
+    /// 获取校准后的时间（毫秒时间戳）
+    /// 使用服务器时间偏移量校准本地时间，确保多客户端时间一致
+    pub fn getSyncedTime(self: *Self) i64 {
+        const local_time = std.time.milliTimestamp();
+        return local_time + self.server_time_offset;
+    }
+
+    /// 检查时间是否已同步
+    pub fn isTimeSynced(self: *Self) bool {
+        return self.time_synced;
     }
 
     /// 关闭与指定节点的连接
@@ -1338,8 +1358,8 @@ pub const PunchClient = struct {
         try writer.writeInt(u16, @intCast(target_machine_id.len), .big);
         try writer.writeAll(target_machine_id);
 
-        // 传输方式 (1 byte) - 默认使用 UDP
-        try writer.writeByte(@intFromEnum(types.TransportType.udp));
+        // 传输方式 (1 byte) - 使用 TCP P2P NAT
+        try writer.writeByte(@intFromEnum(types.TransportType.tcp_p2p_nat));
 
         // 方向 (1 byte) - 正向
         try writer.writeByte(@intFromEnum(types.TunnelDirection.forward));
@@ -1743,7 +1763,24 @@ pub const PunchClient = struct {
 
             switch (header.msg_type) {
                 .heartbeat_response => {
-                    // 心跳响应，忽略
+                    // 心跳响应，解析服务器时间
+                    const hb_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
+                    if (hb_payload.len >= 8) {
+                        const server_time = std.mem.readInt(i64, hb_payload[0..8], .big);
+                        const local_time = std.time.milliTimestamp();
+                        const new_offset = server_time - local_time;
+
+                        // 如果是第一次同步，或者偏移量变化超过 100ms，则更新
+                        if (!self.time_synced or @abs(new_offset - self.server_time_offset) > 100) {
+                            self.server_time_offset = new_offset;
+                            self.time_synced = true;
+
+                            // 同步日志模块的时间偏移
+                            log.setServerTimeOffset(new_offset);
+
+                            log.debug("时间同步: 服务器时间={d}, 本地时间={d}, 偏移={d}ms", .{ server_time, local_time, new_offset });
+                        }
+                    }
                 },
                 .punch_begin => {
                     // 收到打洞开始通知
@@ -2018,7 +2055,7 @@ pub const PunchClient = struct {
 
                     // 自动与新上线节点打洞（使用异步流程）
                     log.info("正在尝试与 {s} 打洞...", .{peer_info.machine_id});
-                    self.initiatePunch(peer_info.machine_id, .udp) catch |e| {
+                    self.initiatePunch(peer_info.machine_id, .tcp_p2p_nat) catch |e| {
                         log.err("发起打洞失败: {any}", .{e});
                     };
                 },

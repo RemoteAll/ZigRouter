@@ -693,19 +693,32 @@ pub const PunchServer = struct {
     }
 
     /// 发送心跳响应（使用 TLS）
+    /// 心跳响应包含服务器当前时间戳，用于客户端时间同步
     fn sendHeartbeatResponseToClient(self: *Self, client: *const ClientInfo) !void {
         _ = self;
+
+        // 构建 payload：服务器当前时间戳（毫秒）
+        var payload_buf: [8]u8 = undefined;
+        const server_time = std.time.milliTimestamp();
+        std.mem.writeInt(i64, &payload_buf, server_time, .big);
+
         const msg_header = protocol.MessageHeader{
             .magic = protocol.PROTOCOL_MAGIC,
             .version = protocol.PROTOCOL_VERSION,
             .msg_type = .heartbeat_response,
-            .data_length = 0,
+            .data_length = 8, // 包含 8 字节时间戳
             .sequence = 0,
         };
 
-        var buf: [protocol.MessageHeader.SIZE]u8 = undefined;
-        try msg_header.serialize(&buf);
-        try client.sendData(&buf);
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        // 合并 header 和 payload
+        var send_buf: [protocol.MessageHeader.SIZE + 8]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE..], &payload_buf);
+
+        try client.sendData(&send_buf);
     }
 
     /// 处理打洞请求（使用 TLS）
@@ -1490,19 +1503,32 @@ pub const PunchServer = struct {
     }
 
     /// 发送心跳响应
+    /// 心跳响应包含服务器当前时间戳，用于客户端时间同步
     fn sendHeartbeatResponse(self: *Self, sock: posix.socket_t) !void {
         _ = self;
+
+        // 构建 payload：服务器当前时间戳（毫秒）
+        var payload_buf: [8]u8 = undefined;
+        const server_time = std.time.milliTimestamp();
+        std.mem.writeInt(i64, &payload_buf, server_time, .big);
+
         const msg_header = protocol.MessageHeader{
             .magic = protocol.PROTOCOL_MAGIC,
             .version = protocol.PROTOCOL_VERSION,
             .msg_type = .heartbeat_response,
-            .data_length = 0,
+            .data_length = 8, // 包含 8 字节时间戳
             .sequence = 0,
         };
 
-        var buf: [protocol.MessageHeader.SIZE]u8 = undefined;
-        try msg_header.serialize(&buf);
-        _ = posix.send(sock, &buf, 0) catch {};
+        var header_buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try msg_header.serialize(&header_buf);
+
+        // 合并 header 和 payload
+        var send_buf: [protocol.MessageHeader.SIZE + 8]u8 = undefined;
+        @memcpy(send_buf[0..protocol.MessageHeader.SIZE], &header_buf);
+        @memcpy(send_buf[protocol.MessageHeader.SIZE..], &payload_buf);
+
+        _ = posix.send(sock, &send_buf, 0) catch {};
     }
 
     /// 处理打洞请求
