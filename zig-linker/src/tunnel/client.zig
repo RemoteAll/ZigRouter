@@ -1941,13 +1941,12 @@ pub const PunchClient = struct {
                                 log.err("发送消息失败: {any}", .{e});
                             };
 
-                            // 等待对方 Hello，循环接收直到收到非协议数据
+                            // 等待对方 Hello
                             var got_hello = false;
                             var recv_attempts: u32 = 0;
-                            while (recv_attempts < 30 and !got_hello) : (recv_attempts += 1) {
+                            while (recv_attempts < 50 and !got_hello) : (recv_attempts += 1) {
                                 if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |hello_len| {
                                     if (hello_len > 0) {
-                                        // 跳过协议残留数据
                                         if (hello_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..hello_len], "linker.zig")) {
                                             log.debug("跳过协议数据: {s}", .{hello_recv_buf[0..hello_len]});
                                             continue;
@@ -1955,21 +1954,19 @@ pub const PunchClient = struct {
                                         log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
                                         got_hello = true;
                                     }
-                                } else |_| {
-                                    // 单次超时，继续等待
-                                }
+                                } else |_| {}
                             }
                             if (!got_hello) {
                                 log.warn("接收对方消息超时", .{});
                             }
                         } else {
-                            // 被动方：先收后发，循环接收直到收到非协议数据
+                            // 被动方：先收后发（增加等待时间，等待主动方打洞完成并发送 Hello）
+                            // 被动方打洞可能比主动方更早完成，需要等待主动方
                             var got_hello = false;
                             var recv_attempts: u32 = 0;
-                            while (recv_attempts < 30 and !got_hello) : (recv_attempts += 1) {
+                            while (recv_attempts < 80 and !got_hello) : (recv_attempts += 1) {
                                 if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |hello_len| {
                                     if (hello_len > 0) {
-                                        // 跳过协议残留数据
                                         if (hello_len >= 10 and std.mem.startsWith(u8, hello_recv_buf[0..hello_len], "linker.zig")) {
                                             log.debug("跳过协议数据: {s}", .{hello_recv_buf[0..hello_len]});
                                             continue;
@@ -1977,14 +1974,13 @@ pub const PunchClient = struct {
                                         log.info("<<< [{s}] <- [{s}] 收到消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_recv_buf[0..hello_len] });
                                         got_hello = true;
                                     }
-                                } else |_| {
-                                    // 单次超时，继续等待
-                                }
+                                } else |_| {}
                             }
                             if (!got_hello) {
                                 log.warn("接收对方消息超时", .{});
                             }
 
+                            // 收到 Hello 后发送回复
                             log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, begin.source_machine_id, hello_msg });
                             _ = mutable_conn.send(hello_msg) catch |e| {
                                 log.err("发送消息失败: {any}", .{e});
@@ -2215,17 +2211,19 @@ pub const PunchClient = struct {
                                 }
                             }
 
-                            // 发起方先发 Hello
+                            // 双方都先发送 Hello，再等待接收
+                            // 解决打洞完成时间不同步导致的超时问题
                             const hello_msg = "Hello";
                             log.info(">>> [{s}] -> [{s}] 发送消息: {s}", .{ self.assigned_id, req.target_id, hello_msg });
                             _ = mutable_conn.send(hello_msg) catch |e| {
                                 log.err("发送消息失败: {any}", .{e});
                             };
 
-                            // 等待对方 Hello，需要循环接收直到收到非协议数据
+                            // 等待对方 Hello，循环接收直到收到非协议数据
+                            // 增加等待时间以应对双方打洞完成时间差（最多等待 5 秒）
                             var got_hello = false;
                             var recv_attempts: u32 = 0;
-                            while (recv_attempts < 30 and !got_hello) : (recv_attempts += 1) {
+                            while (recv_attempts < 50 and !got_hello) : (recv_attempts += 1) {
                                 if (mutable_conn.recvWithTimeout(&hello_recv_buf, 100)) |hello_len| {
                                     if (hello_len > 0) {
                                         // 跳过协议残留数据

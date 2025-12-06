@@ -271,11 +271,11 @@ pub const TransportUdp = struct {
 
     pub const Config = struct {
         /// 连接超时 (毫秒)
-        connect_timeout_ms: u32 = 5000,
+        connect_timeout_ms: u32 = 15000,
         /// 认证超时 (毫秒)
         auth_timeout_ms: u32 = 500,
-        /// 重试次数
-        retry_count: u32 = 3,
+        /// 重试次数 (跨公网时信令消息可能延迟几秒，需要足够的重试)
+        retry_count: u32 = 30,
         /// 是否启用 SSL
         ssl: bool = false,
     };
@@ -365,6 +365,11 @@ pub const TransportUdp = struct {
                     log.debug("UDP 正向连接: 等待超时，重试 ({d}/{d})", .{ retry + 1, self.config.retry_count });
                     continue;
                 }
+                // ConnectionTimedOut 也继续重试（跨公网时常见，被动方可能还没准备好）
+                if (e == error.ConnectionTimedOut) {
+                    log.debug("UDP 正向连接: 连接超时，重试 ({d}/{d})", .{ retry + 1, self.config.retry_count });
+                    continue;
+                }
                 log.err("UDP 正向连接失败: 接收错误: {any}", .{e});
                 log.logPunchFailed(.udp, "接收响应错误");
                 return null;
@@ -445,33 +450,47 @@ pub const TransportUdp = struct {
         log.info("UDP 反向连接: 发送 TTL 包打开 NAT 映射...", .{});
         self.sendTtlPackets(info, sock);
 
-        // 设置接收超时
-        try net_utils.setRecvTimeout(sock, self.config.connect_timeout_ms);
+        // 设置短超时，以便循环发送和接收（打洞需要双方同时发送）
+        const poll_timeout_ms: u32 = 500;
+        try net_utils.setRecvTimeout(sock, poll_timeout_ms);
         log.info("UDP 反向连接: 等待对方连接 (超时: {d}ms)...", .{self.config.connect_timeout_ms});
 
-        // 等待对方消息
+        // 等待对方消息，同时持续发送 UDP 包
         var recv_buf: [1024]u8 = undefined;
         var from_addr: posix.sockaddr = undefined;
         var from_len: posix.socklen_t = @sizeOf(posix.sockaddr);
         var got_auth = false; // 是否收到过认证消息
         var reset_count: u32 = 0; // 统计 ConnectionResetByPeer 次数
+        var retry_count: u32 = 0;
+        const max_retries = self.config.connect_timeout_ms / poll_timeout_ms;
 
-        while (true) {
+        while (retry_count < max_retries) : (retry_count += 1) {
+            // 每次循环都发送 UDP 包，打开/保持 NAT 映射
+            // 这对于端口受限型 NAT 非常重要
+            for (info.remote_endpoints) |ep| {
+                _ = posix.sendto(sock, UDP_AUTH_BYTES, 0, &ep.any, ep.getOsSockLen()) catch {};
+            }
+
             const recv_len = posix.recvfrom(sock, &recv_buf, 0, &from_addr, &from_len) catch |e| {
-                // WouldBlock 表示超时
+                // WouldBlock 表示超时，继续重试
                 if (e == error.WouldBlock) {
-                    log.logPunchFailed(.udp, "等待连接超时");
-                    return null;
+                    log.debug("UDP 反向连接: 等待超时，继续发送并重试 ({d}/{d})", .{ retry_count + 1, max_retries });
+                    continue;
                 }
-                // ConnectionResetByPeer 在 Windows 上表示我们发送的 TTL 包被目标拒绝
-                // 这是正常的打洞过程，忽略并继续等待
+                // ConnectionTimedOut 也继续重试
+                if (e == error.ConnectionTimedOut) {
+                    log.debug("UDP 反向连接: 连接超时，继续发送并重试 ({d}/{d})", .{ retry_count + 1, max_retries });
+                    continue;
+                }
+                // ConnectionResetByPeer 在 Windows 上表示我们发送的包被目标拒绝
+                // 这是正常的打洞过程，忽略并继续
                 if (e == error.ConnectionResetByPeer) {
                     reset_count += 1;
-                    if (reset_count >= 10) {
+                    if (reset_count >= 50) {
                         log.logPunchFailed(.udp, "收到过多 ICMP 不可达消息");
                         return null;
                     }
-                    log.debug("UDP 反向连接: 收到 ICMP 不可达，继续等待 ({d}/10)", .{reset_count});
+                    log.debug("UDP 反向连接: 收到 ICMP 不可达，继续 ({d}/50)", .{reset_count});
                     continue;
                 }
                 log.err("UDP 反向连接失败: {any}", .{e});
@@ -545,6 +564,11 @@ pub const TransportUdp = struct {
                 _ = posix.sendto(sock, data, 0, &from_addr, from_len) catch {};
             }
         }
+
+        // 循环结束，表示重试次数用尽
+        log.err("UDP 反向连接失败: 重试次数用尽", .{});
+        log.logPunchFailed(.udp, "等待连接超时");
+        return null;
     }
 
     /// 发送 TTL 包
