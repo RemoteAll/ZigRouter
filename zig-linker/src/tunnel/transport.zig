@@ -952,7 +952,7 @@ pub const TransportTcpP2PNAT = struct {
     fn tryConnectSingle(ep: net.Address, local_port: u16, timeout_ms: u32) ?posix.socket_t {
         const family = ep.any.family;
         const sock = posix.socket(family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch |e| {
-            log.debug("TCP P2PNAT: 创建 socket 失败: {any}", .{e});
+            log.info("TCP P2PNAT: 创建 socket 失败: {any}", .{e});
             return null;
         };
 
@@ -967,7 +967,7 @@ pub const TransportTcpP2PNAT = struct {
             net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, local_port, 0, 0);
 
         posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen()) catch |e| {
-            log.debug("TCP P2PNAT: bind 到端口 {d} 失败: {any}", .{ local_port, e });
+            log.info("TCP P2PNAT: bind 到端口 {d} 失败: {any}", .{ local_port, e });
             posix.close(sock);
             return null;
         };
@@ -977,25 +977,25 @@ pub const TransportTcpP2PNAT = struct {
 
         // 设置为非阻塞模式
         net_utils.setNonBlocking(sock, true) catch |e| {
-            log.debug("TCP P2PNAT: 设置非阻塞失败: {any}", .{e});
+            log.info("TCP P2PNAT: 设置非阻塞失败: {any}", .{e});
             posix.close(sock);
             return null;
         };
 
         // 打印目标端点
         const ep_str = log.formatAddress(ep);
-        log.debug("TCP P2PNAT: 正在连接 {s} (本地端口 {d})...", .{ std.mem.sliceTo(&ep_str, 0), local_port });
+        log.info("TCP P2PNAT: 正在连接 {s} (本地端口 {d})...", .{ std.mem.sliceTo(&ep_str, 0), local_port });
 
         // 尝试非阻塞连接
         const connect_result = posix.connect(sock, &ep.any, ep.getOsSockLen());
         if (connect_result) |_| {
             // 立即成功
-            log.debug("TCP P2PNAT: 连接立即成功!", .{});
+            log.info("TCP P2PNAT: 连接立即成功!", .{});
             net_utils.setNonBlocking(sock, false) catch {};
             return sock;
         } else |e| {
             if (e != error.WouldBlock) {
-                log.debug("TCP P2PNAT: 连接失败: {any}", .{e});
+                log.info("TCP P2PNAT: 连接失败: {any}", .{e});
                 posix.close(sock);
                 return null;
             }
@@ -1010,20 +1010,20 @@ pub const TransportTcpP2PNAT = struct {
         }};
 
         const poll_result = posix.poll(&poll_fds, @intCast(timeout_ms)) catch |e| {
-            log.debug("TCP P2PNAT: poll 失败: {any}", .{e});
+            log.info("TCP P2PNAT: poll 失败: {any}", .{e});
             posix.close(sock);
             return null;
         };
 
         if (poll_result == 0) {
-            log.debug("TCP P2PNAT: 连接超时 ({d}ms)", .{timeout_ms});
+            log.info("TCP P2PNAT: 连接超时 ({d}ms)", .{timeout_ms});
             posix.close(sock);
             return null;
         }
 
         // 检查连接是否成功
         if (poll_fds[0].revents & posix.POLL.ERR != 0 or poll_fds[0].revents & posix.POLL.HUP != 0) {
-            log.debug("TCP P2PNAT: poll 返回错误 (revents=0x{x})", .{poll_fds[0].revents});
+            log.info("TCP P2PNAT: poll 返回错误 (revents=0x{x})", .{poll_fds[0].revents});
             posix.close(sock);
             return null;
         }
@@ -1031,13 +1031,13 @@ pub const TransportTcpP2PNAT = struct {
         // 获取 socket 错误状态
         var sock_err: c_int = 0;
         posix.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&sock_err)) catch |e| {
-            log.debug("TCP P2PNAT: getsockopt 失败: {any}", .{e});
+            log.info("TCP P2PNAT: getsockopt 失败: {any}", .{e});
             posix.close(sock);
             return null;
         };
 
         if (sock_err != 0) {
-            log.debug("TCP P2PNAT: socket 错误: {d}", .{sock_err});
+            log.info("TCP P2PNAT: socket 错误: {d}", .{sock_err});
             posix.close(sock);
             return null;
         }
@@ -1045,7 +1045,7 @@ pub const TransportTcpP2PNAT = struct {
         // 恢复为阻塞模式
         net_utils.setNonBlocking(sock, false) catch {};
 
-        log.debug("TCP P2PNAT: 连接成功!", .{});
+        log.info("TCP P2PNAT: 连接成功!", .{});
         return sock;
     }
 
