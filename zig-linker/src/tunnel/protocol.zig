@@ -390,10 +390,14 @@ pub const PunchBegin = struct {
     ssl: bool,
     /// 是否在同一局域网
     same_lan: bool,
-    /// 对方公网地址字符串
-    public_endpoint: []const u8,
-    /// 对方本地地址字符串
-    local_endpoint: []const u8,
+    /// 对方公网地址字符串（服务器转发时已交换，这是对方的地址）
+    remote_public_endpoint: []const u8,
+    /// 对方本地地址字符串（服务器转发时已交换，这是对方的地址）
+    remote_local_endpoint: []const u8,
+    /// 我方公网地址字符串（服务器转发时保留，这是我应该使用的地址）
+    my_public_endpoint: []const u8,
+    /// 我方本地地址字符串（服务器转发时保留，这是我应该使用的地址）
+    my_local_endpoint: []const u8,
     /// 原始数据引用
     _raw_data: []const u8,
 
@@ -446,24 +450,46 @@ pub const PunchBegin = struct {
             offset += 1;
         }
 
-        // 公网地址
-        var public_endpoint: []const u8 = "";
+        // 对方公网地址（发送时是 my_public，服务器转发后变成对方的地址）
+        var remote_public_endpoint: []const u8 = "";
         if (offset + 2 <= data.len) {
             const pub_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
             offset += 2;
             if (offset + pub_len <= data.len) {
-                public_endpoint = data[offset .. offset + pub_len];
+                remote_public_endpoint = data[offset .. offset + pub_len];
                 offset += pub_len;
             }
         }
 
-        // 本地地址
-        var local_endpoint: []const u8 = "";
+        // 对方本地地址（发送时是 my_local，服务器转发后变成对方的地址）
+        var remote_local_endpoint: []const u8 = "";
         if (offset + 2 <= data.len) {
             const local_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
             offset += 2;
             if (offset + local_len <= data.len) {
-                local_endpoint = data[offset .. offset + local_len];
+                remote_local_endpoint = data[offset .. offset + local_len];
+                offset += local_len;
+            }
+        }
+
+        // 我方公网地址（发送时是 remote_public，服务器转发后变成我的地址）
+        var my_public_endpoint: []const u8 = "";
+        if (offset + 2 <= data.len) {
+            const pub_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
+            offset += 2;
+            if (offset + pub_len <= data.len) {
+                my_public_endpoint = data[offset .. offset + pub_len];
+                offset += pub_len;
+            }
+        }
+
+        // 我方本地地址（发送时是 remote_local，服务器转发后变成我的地址）
+        var my_local_endpoint: []const u8 = "";
+        if (offset + 2 <= data.len) {
+            const local_len = std.mem.readInt(u16, data[offset .. offset + 2][0..2], .big);
+            offset += 2;
+            if (offset + local_len <= data.len) {
+                my_local_endpoint = data[offset .. offset + local_len];
                 offset += local_len;
             }
         }
@@ -477,8 +503,10 @@ pub const PunchBegin = struct {
             .flow_id = flow_id,
             .ssl = ssl,
             .same_lan = same_lan,
-            .public_endpoint = public_endpoint,
-            .local_endpoint = local_endpoint,
+            .remote_public_endpoint = remote_public_endpoint,
+            .remote_local_endpoint = remote_local_endpoint,
+            .my_public_endpoint = my_public_endpoint,
+            .my_local_endpoint = my_local_endpoint,
             ._raw_data = data,
         };
     }

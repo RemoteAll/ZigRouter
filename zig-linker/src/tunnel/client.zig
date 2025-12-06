@@ -1226,14 +1226,14 @@ pub const PunchClient = struct {
         log.info("  发起方: {s}", .{begin.source_machine_id});
         log.info("  发起方 NAT: {s}", .{begin.source_nat_type.description()});
         log.info("  传输方式: {s}", .{begin.transport.description()});
-        log.info("  消息中本地端点: {s}", .{begin.local_endpoint});
-        log.info("  消息中公网端点: {s}", .{begin.public_endpoint});
+        log.info("  消息中本地端点: {s}", .{begin.remote_local_endpoint});
+        log.info("  消息中公网端点: {s}", .{begin.remote_public_endpoint});
         log.info("========================================", .{});
 
         // 解析消息中携带的本地端口信息（这是发起方之前获取的我方最新端口）
         // 不要在这里刷新，否则会导致端口不匹配
-        const parsed_local = net_utils.parseEndpointString(begin.local_endpoint);
-        const parsed_public = net_utils.parseEndpointString(begin.public_endpoint);
+        const parsed_local = net_utils.parseEndpointString(begin.my_local_endpoint);
+        const parsed_public = net_utils.parseEndpointString(begin.my_public_endpoint);
 
         // 如果消息中有端点信息就用，否则回退到当前已知的端点
         const local_addr = parsed_local orelse self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
@@ -1766,11 +1766,11 @@ pub const PunchClient = struct {
                     log.info("║ 传输方式:      {s}", .{begin.transport.description()});
                     log.info("║ 需要 SSL:      {s}", .{if (begin.ssl) "是" else "否"});
                     log.info("║ 同一局域网:    {s}", .{if (begin.same_lan) "✓ 是" else "✗ 否"});
-                    if (begin.public_endpoint.len > 0) {
-                        log.info("║ 对方公网地址:  {s}", .{begin.public_endpoint});
+                    if (begin.remote_public_endpoint.len > 0) {
+                        log.info("║ 对方公网地址:  {s}", .{begin.remote_public_endpoint});
                     }
-                    if (begin.local_endpoint.len > 0) {
-                        log.info("║ 对方本地地址:  {s}", .{begin.local_endpoint});
+                    if (begin.remote_local_endpoint.len > 0) {
+                        log.info("║ 对方本地地址:  {s}", .{begin.remote_local_endpoint});
                     }
                     log.info("╠══════════════════════════════════════════════════════════════╣", .{});
 
@@ -1797,21 +1797,21 @@ pub const PunchClient = struct {
                     log.info("", .{});
                     log.info("响应打洞请求，使用发起方指定的方式: {s}", .{begin.transport.description()});
 
-                    // 解析对方地址
+                    // 解析对方地址（从消息中的 remote_* 字段获取）
                     var remote_endpoints: [4]net.Address = undefined;
                     var endpoint_count: usize = 0;
 
-                    // 从 begin 消息中解析地址
-                    if (begin.local_endpoint.len > 0) {
-                        if (parseEndpointString(begin.local_endpoint)) |addr| {
+                    // 从 begin 消息中解析对方地址
+                    if (begin.remote_local_endpoint.len > 0) {
+                        if (parseEndpointString(begin.remote_local_endpoint)) |addr| {
                             remote_endpoints[endpoint_count] = addr;
                             endpoint_count += 1;
                             const addr_str = log.formatAddress(addr);
                             log.info("  对方本地地址: {s}", .{std.mem.sliceTo(&addr_str, 0)});
                         }
                     }
-                    if (begin.public_endpoint.len > 0) {
-                        if (parseEndpointString(begin.public_endpoint)) |addr| {
+                    if (begin.remote_public_endpoint.len > 0) {
+                        if (parseEndpointString(begin.remote_public_endpoint)) |addr| {
                             remote_endpoints[endpoint_count] = addr;
                             endpoint_count += 1;
                             const addr_str = log.formatAddress(addr);
@@ -1824,6 +1824,30 @@ pub const PunchClient = struct {
                         continue;
                     }
 
+                    // 解析我方应该使用的地址（从消息中的 my_* 字段获取）
+                    // 这是发起方通过服务器告诉我应该用的端口
+                    var my_local_addr: ?net.Address = null;
+                    var my_public_addr: ?net.Address = null;
+
+                    if (begin.my_local_endpoint.len > 0) {
+                        if (parseEndpointString(begin.my_local_endpoint)) |addr| {
+                            my_local_addr = addr;
+                            const addr_str = log.formatAddress(addr);
+                            log.info("  我方本地地址(消息指定): {s}", .{std.mem.sliceTo(&addr_str, 0)});
+                        }
+                    }
+                    if (begin.my_public_endpoint.len > 0) {
+                        if (parseEndpointString(begin.my_public_endpoint)) |addr| {
+                            my_public_addr = addr;
+                            const addr_str = log.formatAddress(addr);
+                            log.info("  我方公网地址(消息指定): {s}", .{std.mem.sliceTo(&addr_str, 0)});
+                        }
+                    }
+
+                    // 如果消息中没有指定我方地址，使用当前已知地址
+                    const local_to_use = my_local_addr orelse self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+                    const public_to_use = my_public_addr orelse self.public_addr;
+
                     // 构造传输信息
                     // direction 保持原样：forward 表示我是发起方，reverse 表示我是被动方
                     const transport_info = types.TunnelTransportInfo{
@@ -1833,10 +1857,11 @@ pub const PunchClient = struct {
                             .machine_id = self.assigned_id,
                             .machine_name = self.config.machine_name,
                             .nat_type = self.local_nat_type,
-                            // 关键：使用 UDP 本地地址进行打洞，确保端口与 NAT 映射匹配
-                            .local = self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+                            // 关键：使用消息中指定的地址，而不是当前的 self.udp_local_addr
+                            // 因为并发打洞时 self.udp_local_addr 可能已经变化
+                            .local = local_to_use,
                             .local_ips = &.{},
-                            .remote = self.public_addr,
+                            .remote = public_to_use,
                             .port_map_wan = self.config.port_map_wan,
                             .port_map_lan = 0,
                             .route_level = 8,
@@ -2384,30 +2409,30 @@ pub const PunchClient = struct {
 
         if (begin.same_lan) {
             // 同局域网：优先使用本地地址
-            if (begin.local_endpoint.len > 0) {
-                if (parseEndpointString(begin.local_endpoint)) |addr| {
+            if (begin.remote_local_endpoint.len > 0) {
+                if (parseEndpointString(begin.remote_local_endpoint)) |addr| {
                     remote_endpoints[remote_count] = addr;
                     remote_count += 1;
-                    log.debug("同局域网模式：使用本地地址 {s}", .{begin.local_endpoint});
+                    log.debug("同局域网模式：使用本地地址 {s}", .{begin.remote_local_endpoint});
                 }
             }
             // 备选：公网地址
-            if (begin.public_endpoint.len > 0) {
-                if (parseEndpointString(begin.public_endpoint)) |addr| {
+            if (begin.remote_public_endpoint.len > 0) {
+                if (parseEndpointString(begin.remote_public_endpoint)) |addr| {
                     remote_endpoints[remote_count] = addr;
                     remote_count += 1;
                 }
             }
         } else {
             // 跨网络：优先使用公网地址
-            if (begin.public_endpoint.len > 0) {
-                if (parseEndpointString(begin.public_endpoint)) |addr| {
+            if (begin.remote_public_endpoint.len > 0) {
+                if (parseEndpointString(begin.remote_public_endpoint)) |addr| {
                     remote_endpoints[remote_count] = addr;
                     remote_count += 1;
                 }
             }
-            if (begin.local_endpoint.len > 0) {
-                if (parseEndpointString(begin.local_endpoint)) |addr| {
+            if (begin.remote_local_endpoint.len > 0) {
+                if (parseEndpointString(begin.remote_local_endpoint)) |addr| {
                     remote_endpoints[remote_count] = addr;
                     remote_count += 1;
                 }
