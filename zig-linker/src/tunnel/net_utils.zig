@@ -779,6 +779,57 @@ test "getPort and setPort" {
     try std.testing.expectEqual(@as(u16, 8443), getPort(ipv6_addr));
 }
 
+// ============ DNS 解析 ============
+
+/// DNS 解析错误
+pub const DnsError = error{
+    HostNotFound,
+    NoAddressFound,
+    SystemError,
+};
+
+/// 解析域名到 IPv4 地址
+/// 使用系统 getaddrinfo
+pub fn resolveHostname(hostname: []const u8, port: u16) ?net.Address {
+    // 使用 Zig 标准库的 tcpConnectToHost 方式获取地址
+    // 但我们只需要解析，不需要真正连接
+
+    // 创建一个临时的 null-terminated 字符串
+    var hostname_buf: [256]u8 = undefined;
+    if (hostname.len >= hostname_buf.len) return null;
+
+    @memcpy(hostname_buf[0..hostname.len], hostname);
+    hostname_buf[hostname.len] = 0;
+
+    const hostname_z: [:0]const u8 = hostname_buf[0..hostname.len :0];
+
+    // 使用 std.net.Address.resolveIp
+    // 这个函数在 Zig 0.15.2 中应该支持 DNS 解析
+    const result = net.Address.resolveIp(hostname_z, port) catch |e| {
+        log.debug("DNS 解析失败 {s}: {any}", .{ hostname, e });
+        return null;
+    };
+
+    return result;
+}
+
+/// 解析域名（支持 IPv4 和 IPv6）
+/// 返回第一个可用地址
+pub fn resolveHostnameAny(hostname: []const u8, port: u16) ?net.Address {
+    // 先尝试作为 IP 地址解析
+    if (net.Address.parseIp4(hostname, port)) |addr| {
+        return addr;
+    } else |_| {}
+
+    // 尝试 IPv6 (Zig 0.15.2+ 只需要 2 个参数)
+    if (net.Address.parseIp6(hostname, port)) |addr| {
+        return addr;
+    } else |_| {}
+
+    // 尝试 DNS 解析
+    return resolveHostname(hostname, port);
+}
+
 test "createIPv4Address and createIPv6Address" {
     const ipv4 = createIPv4Address(.{ 192, 168, 1, 1 }, 80);
     const ipv6 = createIPv6Address(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 443, 0);

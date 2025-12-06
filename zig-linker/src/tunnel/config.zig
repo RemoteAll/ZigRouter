@@ -35,6 +35,23 @@ pub const TlsConfiguration = struct {
     client_key_file: []const u8 = "",
 };
 
+/// STUN 服务器配置
+pub const StunConfiguration = struct {
+    /// 是否启用完整 NAT 类型检测
+    enabled: bool = true,
+    /// STUN 服务器列表（优先使用国内可访问的服务器）
+    servers: []const []const u8 = &.{
+        "stun.miwifi.com:3478", // 小米 STUN 服务器（国内）
+        "stun.qq.com:3478", // 腾讯 STUN 服务器（国内）
+        "stun.chat.bilibili.com:3478", // B站 STUN 服务器（国内）
+        "stun.cloudflare.com:3478", // Cloudflare（国际，但通常可访问）
+    },
+    /// 超时时间（毫秒）
+    timeout_ms: u32 = 3000,
+    /// 重试次数
+    retry_count: u32 = 2,
+};
+
 /// 客户端配置
 pub const ClientConfiguration = struct {
     /// 配置文件版本
@@ -72,6 +89,9 @@ pub const ClientConfiguration = struct {
 
     /// TLS 加密配置
     tls: TlsConfiguration = .{},
+
+    /// STUN 服务器配置
+    stun: StunConfiguration = .{},
 
     /// 打洞方式配置（按优先级排序）
     transports: []TransportConfig = &.{},
@@ -339,6 +359,22 @@ pub const ConfigManager = struct {
         try writer.print("    \"client_key_file\": \"{s}\"\n", .{self.config.tls.client_key_file});
         try writer.writeAll("  },\n");
         try writer.writeAll("\n");
+        try writer.writeAll("  \"// STUN NAT 类型检测设置 (用于完整检测 NAT 类型)\": \"\",\n");
+        try writer.writeAll("  \"stun\": {\n");
+        try writer.print("    \"enabled\": {s},\n", .{if (self.config.stun.enabled) "true" else "false"});
+        try writer.print("    \"timeout_ms\": {d},\n", .{self.config.stun.timeout_ms});
+        try writer.print("    \"retry_count\": {d},\n", .{self.config.stun.retry_count});
+        try writer.writeAll("    \"servers\": [\n");
+        for (self.config.stun.servers, 0..) |server, i| {
+            if (i < self.config.stun.servers.len - 1) {
+                try writer.print("      \"{s}\",\n", .{server});
+            } else {
+                try writer.print("      \"{s}\"\n", .{server});
+            }
+        }
+        try writer.writeAll("    ]\n");
+        try writer.writeAll("  },\n");
+        try writer.writeAll("\n");
         try writer.writeAll("  \"// 打洞方式配置 (按优先级排序，数字越小越优先)\": \"\",\n");
         try writer.writeAll("  \"transports\": [\n");
 
@@ -428,8 +464,69 @@ pub const ConfigManager = struct {
             self.config.log_color = value;
         }
 
+        // 解析 stun 配置
+        if (findJsonObject(content, "stun")) |stun_content| {
+            if (findJsonBool(stun_content, "enabled")) |value| {
+                self.config.stun.enabled = value;
+            }
+            if (findJsonNumber(stun_content, "timeout_ms")) |value| {
+                self.config.stun.timeout_ms = @intCast(value);
+            }
+            if (findJsonNumber(stun_content, "retry_count")) |value| {
+                self.config.stun.retry_count = @intCast(value);
+            }
+            // 解析 stun.servers 数组
+            self.config.stun.servers = try self.parseStunServers(stun_content);
+        }
+
         // 解析 transports 数组
         self.config.transports = try self.parseTransports(content);
+    }
+
+    /// 解析 STUN 服务器列表
+    fn parseStunServers(self: *Self, content: []const u8) ![]const []const u8 {
+        var list: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (list.items) |s| {
+                self.allocator.free(s);
+            }
+            list.deinit(self.allocator);
+        }
+
+        // 默认 STUN 服务器列表
+        const default_stun = StunConfiguration{};
+
+        // 查找 servers 数组
+        const key = "\"servers\"";
+        const key_pos = std.mem.indexOf(u8, content, key) orelse {
+            // 使用默认配置
+            return default_stun.servers;
+        };
+
+        // 找到数组开始位置
+        const array_start = std.mem.indexOfPos(u8, content, key_pos, "[") orelse return default_stun.servers;
+        const array_end = findMatchingBracket(content, array_start) orelse return default_stun.servers;
+
+        const array_content = content[array_start + 1 .. array_end];
+
+        // 解析每个字符串
+        var pos: usize = 0;
+        while (pos < array_content.len) {
+            // 找到字符串开始
+            const str_start = std.mem.indexOfPos(u8, array_content, pos, "\"") orelse break;
+            const str_end = std.mem.indexOfPos(u8, array_content, str_start + 1, "\"") orelse break;
+
+            const server = array_content[str_start + 1 .. str_end];
+            try list.append(self.allocator, try self.allocator.dupe(u8, server));
+
+            pos = str_end + 1;
+        }
+
+        if (list.items.len == 0) {
+            return default_stun.servers;
+        }
+
+        return list.toOwnedSlice(self.allocator);
     }
 
     /// 解析 transports 数组
@@ -636,6 +733,21 @@ fn findMatchingBrace(content: []const u8, start: usize) ?usize {
         }
     }
     return null;
+}
+
+/// 查找 JSON 对象值
+fn findJsonObject(content: []const u8, key: []const u8) ?[]const u8 {
+    var search_buf: [256]u8 = undefined;
+    const search = std.fmt.bufPrint(&search_buf, "\"{s}\"", .{key}) catch return null;
+
+    const key_pos = std.mem.indexOf(u8, content, search) orelse return null;
+    const colon_pos = std.mem.indexOfPos(u8, content, key_pos + search.len, ":") orelse return null;
+
+    // 找到对象开始位置
+    const obj_start = std.mem.indexOfPos(u8, content, colon_pos + 1, "{") orelse return null;
+    const obj_end = findMatchingBrace(content, obj_start) orelse return null;
+
+    return content[obj_start .. obj_end + 1];
 }
 
 // ============ 测试 ============

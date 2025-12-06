@@ -13,6 +13,7 @@ const protocol = @import("protocol.zig");
 const transport_mod = @import("transport.zig");
 const config_mod = @import("config.zig");
 const tls = @import("tls.zig");
+const stun = @import("stun.zig");
 
 /// 格式化地址为可读字符串
 fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
@@ -76,6 +77,8 @@ pub const ClientConfig = struct {
     tls_skip_verify: bool = false,
     /// 传输方式配置列表（打洞方式优先级）
     transports: []const config_mod.TransportConfig = &.{},
+    /// STUN 服务器配置
+    stun: config_mod.StunConfiguration = .{},
 };
 
 /// 打洞结果
@@ -144,6 +147,15 @@ pub const PunchClient = struct {
     /// 节点下线回调
     on_peer_offline: ?*const fn (*Self, *const protocol.PeerOffline) void = null,
 
+    /// NAT 类型检测线程
+    nat_detect_thread: ?std.Thread = null,
+
+    /// 线程停止标志
+    should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// NAT 类型检测完成回调
+    on_nat_type_detected: ?*const fn (*Self, types.NatType) void = null,
+
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Self {
         return Self{
             .allocator = allocator,
@@ -153,6 +165,13 @@ pub const PunchClient = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // 停止 NAT 检测线程
+        self.should_stop.store(true, .seq_cst);
+        if (self.nat_detect_thread) |thread| {
+            thread.join();
+            self.nat_detect_thread = null;
+        }
+
         self.disconnect();
         self.transport_manager.deinit();
         if (self.assigned_id.len > 0) {
@@ -177,9 +196,10 @@ pub const PunchClient = struct {
             log.warn("  TLS 加密: 已禁用 (不建议在公网使用)", .{});
         }
 
-        // 检测 NAT 类型
+        // 第一步：快速获取公网地址（用于确定 UDP 打洞端口）
+        // 这是同步操作，因为打洞需要知道端口
         if (self.config.auto_detect_nat) {
-            try self.detectNatType();
+            self.getPublicAddressQuick();
         }
 
         // 连接服务器
@@ -235,10 +255,19 @@ pub const PunchClient = struct {
 
         // 发送注册消息
         try self.register();
+
+        // 第二步：异步启动 STUN NAT 类型检测（不阻塞主流程）
+        log.debug("NAT检测配置: auto_detect_nat={}, stun.enabled={}", .{ self.config.auto_detect_nat, self.config.stun.enabled });
+        if (self.config.auto_detect_nat and self.config.stun.enabled) {
+            self.startAsyncNatDetection();
+        }
     }
 
     /// 断开连接
     pub fn disconnect(self: *Self) void {
+        // 停止异步 NAT 检测
+        self.should_stop.store(true, .seq_cst);
+
         if (self.tls_conn) |*tc| {
             tc.close();
             self.tls_conn = null;
@@ -249,13 +278,83 @@ pub const PunchClient = struct {
         self.registered = false;
     }
 
-    /// 检测 NAT 类型（通过 Linker 服务端 UDP 探测）
+    /// 快速获取公网地址（同步，用于确定 UDP 打洞端口）
+    fn getPublicAddressQuick(self: *Self) void {
+        log.info("正在获取公网地址...", .{});
+
+        // 通过 Linker 服务端 UDP 探测获取公网地址
+        if (self.getExternalAddrFromLinker()) |result| {
+            self.public_addr = result.public_addr;
+            self.udp_local_addr = result.local_addr;
+            var udp_addr_buf: [64]u8 = undefined;
+            const udp_addr_str = formatAddress(result.local_addr, &udp_addr_buf);
+            log.info("UDP 打洞本地端口: {s}", .{udp_addr_str});
+            if (result.public_addr) |pub_addr| {
+                var pub_addr_buf: [64]u8 = undefined;
+                log.info("公网地址: {s}", .{formatAddress(pub_addr, &pub_addr_buf)});
+            }
+        } else |e| {
+            log.warn("UDP 探测失败: {any}，将使用 TCP 地址", .{e});
+            self.udp_local_addr = self.local_addr;
+        }
+    }
+
+    /// 启动异步 NAT 类型检测
+    fn startAsyncNatDetection(self: *Self) void {
+        log.info("启动异步 NAT 类型检测...", .{});
+
+        // 启动检测线程
+        self.nat_detect_thread = std.Thread.spawn(.{}, asyncNatDetectWorker, .{self}) catch |e| {
+            log.warn("启动 NAT 检测线程失败: {any}", .{e});
+            return;
+        };
+    }
+
+    /// 异步 NAT 检测工作线程
+    fn asyncNatDetectWorker(self: *Self) void {
+        // 检查停止标志
+        if (self.should_stop.load(.seq_cst)) return;
+
+        // 执行 STUN NAT 类型检测
+        if (self.detectNatTypeWithStun()) |nat_type| {
+            self.local_nat_type = nat_type;
+            log.info("========= NAT 检测结果 (异步) =========", .{});
+            log.info("NAT 类型: {s}", .{nat_type.description()});
+            log.info("================================", .{});
+
+            // 调用回调通知
+            if (self.on_nat_type_detected) |callback| {
+                callback(self, nat_type);
+            }
+
+            // 如果已注册，更新服务器上的 NAT 类型
+            if (self.registered and !self.should_stop.load(.seq_cst)) {
+                self.updateNatTypeToServer(nat_type) catch |e| {
+                    log.warn("更新 NAT 类型到服务器失败: {any}", .{e});
+                };
+            }
+        } else |e| {
+            log.warn("STUN NAT 类型检测失败: {any}", .{e});
+        }
+    }
+
+    /// 更新 NAT 类型到服务器
+    fn updateNatTypeToServer(self: *Self, nat_type: types.NatType) !void {
+        _ = nat_type;
+        // TODO: 发送 NAT 类型更新消息到服务器
+        // 当前服务端协议可能还不支持此功能，暂时只记录日志
+        log.debug("NAT 类型已更新为: {s}", .{self.local_nat_type.description()});
+    }
+
+    /// 检测 NAT 类型（保留用于手动同步检测）
+    /// 1. 首先通过 Linker 服务端获取公网地址（确定 UDP 打洞端口）
+    /// 2. 然后使用外部 STUN 服务器做完整的 NAT 类型检测 (RFC 3489)
     fn detectNatType(self: *Self) !void {
         log.info("正在检测 NAT 类型...", .{});
 
-        // 使用 Linker 服务端的 UDP 探测（与 C# linker 一致，不依赖外部 STUN 服务）
+        // 第一步：通过 Linker 服务端 UDP 探测获取公网地址
+        // 这一步确定打洞时要使用的 UDP 端口
         if (self.getExternalAddrFromLinker()) |result| {
-            self.local_nat_type = result.nat_type;
             self.public_addr = result.public_addr;
             // 保存 UDP 本地地址，用于后续打洞
             // 这是关键：打洞时必须使用这个端口，而不是 TCP 连接的端口
@@ -264,26 +363,118 @@ pub const PunchClient = struct {
             var udp_addr_buf: [64]u8 = undefined;
             const udp_addr_str = formatAddress(result.local_addr, &udp_addr_buf);
             log.info("UDP 打洞本地端口: {s}", .{udp_addr_str});
-            log.logNatDetection(
-                result.nat_type,
-                result.local_addr, // 使用 UDP 本地地址而不是 TCP 地址
-                result.public_addr,
-            );
-            return;
         } else |e| {
-            log.warn("Linker UDP 探测失败: {any}，使用默认 NAT 类型", .{e});
-            self.local_nat_type = .unknown;
+            log.warn("Linker UDP 探测失败: {any}，将使用外部 STUN 服务器", .{e});
             // UDP 探测失败时，使用 TCP 地址作为备选
             self.udp_local_addr = self.local_addr;
         }
+
+        // 第二步：使用外部 STUN 服务器做完整的 NAT 类型检测
+        if (self.config.stun.enabled) {
+            if (self.detectNatTypeWithStun()) |nat_type| {
+                self.local_nat_type = nat_type;
+            } else |e| {
+                log.warn("STUN NAT 类型检测失败: {any}，NAT 类型未知", .{e});
+                self.local_nat_type = .unknown;
+            }
+        } else {
+            // STUN 禁用
+            log.info("STUN NAT 类型检测已禁用", .{});
+            self.local_nat_type = .unknown;
+        }
+
+        // 输出检测结果
+        log.logNatDetection(
+            self.local_nat_type,
+            self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+            self.public_addr,
+        );
+    }
+
+    /// 使用外部 STUN 服务器检测 NAT 类型 (RFC 3489 完整算法)
+    fn detectNatTypeWithStun(self: *Self) !types.NatType {
+        // 获取 UDP 本地端口用于 STUN 检测
+        const local_port = if (self.udp_local_addr) |addr| addr.getPort() else 0;
+        const local_addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, local_port);
+
+        // 遍历 STUN 服务器列表
+        for (self.config.stun.servers) |server_str| {
+            log.info("尝试 STUN 服务器: {s}", .{server_str});
+
+            // 解析服务器地址（支持域名 DNS 解析）
+            const server_addr = self.parseStunServer(server_str) orelse {
+                log.debug("无法解析 STUN 服务器: {s}", .{server_str});
+                continue;
+            };
+
+            // 创建 STUN 客户端
+            var client = stun.StunClient.init(server_addr, local_addr, .{
+                .recv_timeout_ms = self.config.stun.timeout_ms,
+                .retry_count = self.config.stun.retry_count,
+                .use_rfc5389 = false, // 使用 RFC 3489 进行 NAT 类型检测
+            });
+            defer client.deinit();
+
+            // 执行 NAT 类型检测
+            if (client.query()) |result| {
+                // 检测成功
+                if (result.nat_type != .unknown and result.nat_type != .unsupported_server) {
+                    log.info("STUN NAT 类型检测成功", .{});
+
+                    // 如果之前没有获取到公网地址，使用 STUN 结果
+                    if (self.public_addr == null) {
+                        self.public_addr = result.public_endpoint;
+                    }
+
+                    return result.nat_type;
+                } else if (result.nat_type == .unsupported_server) {
+                    log.debug("STUN 服务器不支持完整 NAT 检测，尝试下一个", .{});
+                    continue;
+                }
+            } else |e| {
+                log.debug("STUN 服务器 {s} 检测失败: {any}", .{ server_str, e });
+                continue;
+            }
+        }
+
+        return error.AllStunServersFailed;
+    }
+
+    /// 解析 STUN 服务器地址 (格式: host:port)
+    /// 支持 IP 地址和域名（使用 std.net.getAddressList 进行 DNS 解析）
+    fn parseStunServer(self: *Self, server_str: []const u8) ?net.Address {
+        // 查找端口分隔符
+        if (std.mem.lastIndexOfScalar(u8, server_str, ':')) |colon_idx| {
+            const host = server_str[0..colon_idx];
+            const port_str = server_str[colon_idx + 1 ..];
+            const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+
+            // 先尝试解析为 IP 地址（快速路径）
+            if (net.Address.parseIp4(host, port)) |addr| {
+                return addr;
+            } else |_| {}
+
+            // 使用 std.net.getAddressList 进行 DNS 解析
+            log.debug("DNS 解析: {s}", .{host});
+            const addr_list = net.getAddressList(self.allocator, host, port) catch |e| {
+                log.debug("DNS 解析 {s} 失败: {any}", .{ host, e });
+                return null;
+            };
+            defer addr_list.deinit();
+
+            // 返回第一个地址
+            if (addr_list.addrs.len > 0) {
+                return addr_list.addrs[0];
+            }
+        }
+        return null;
     }
 
     /// 通过 Linker 服务端 UDP 获取公网地址
-    /// 返回公网地址、本地 UDP 地址和 NAT 类型
+    /// 返回公网地址、本地 UDP 地址
     const LinkerExternalResult = struct {
         public_addr: ?net.Address,
         local_addr: net.Address, // UDP socket 的本地地址（包含正确的打洞端口）
-        nat_type: types.NatType,
     };
 
     fn getExternalAddrFromLinker(self: *Self) !LinkerExternalResult {
@@ -424,7 +615,6 @@ pub const PunchClient = struct {
             return LinkerExternalResult{
                 .public_addr = public_addr,
                 .local_addr = local_udp_addr,
-                .nat_type = .unknown,
             };
         }
 
@@ -1867,6 +2057,8 @@ pub fn main() !void {
         .tls_skip_verify = cmd_tls_skip_verify orelse !config_manager.config.tls.verify_server,
         // 传输方式配置
         .transports = config_manager.config.transports,
+        // STUN 服务器配置
+        .stun = config_manager.config.stun,
     };
 
     log.info("", .{});
