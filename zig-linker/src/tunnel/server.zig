@@ -404,6 +404,32 @@ pub const PunchServer = struct {
         return offset;
     }
 
+    /// 处理 TCP 端口探测请求
+    /// 与 UDP 探测类似，但使用 TCP 连接，适用于 TCP 打洞场景
+    fn handleTcpPortProbe(self: *Self, sock: posix.socket_t, client_ep: net.Address, tls_conn: ?*tls.TlsConnection) void {
+        var response: [64]u8 = undefined;
+        const response_len = self.buildExternalAddrResponse(&response, client_ep);
+
+        // 发送响应
+        if (tls_conn) |tc| {
+            _ = tc.send(response[0..response_len]) catch |e| {
+                log.warn("TCP 端口探测响应发送失败 (TLS): {any}", .{e});
+                return;
+            };
+        } else {
+            _ = posix.send(sock, response[0..response_len], 0) catch |e| {
+                log.warn("TCP 端口探测响应发送失败: {any}", .{e});
+                return;
+            };
+        }
+
+        const addr_str = log.formatAddress(client_ep);
+        log.info("TCP 端口探测响应已发送: {s}", .{&addr_str});
+
+        // 关闭连接（端口探测是一次性的）
+        posix.close(sock);
+    }
+
     /// 客户端处理线程函数
     fn handleClientThread(self: *Self, sock: posix.socket_t, client_ep: net.Address) void {
         self.handleClient(sock, client_ep) catch |e| {
@@ -416,6 +442,31 @@ pub const PunchServer = struct {
     fn handleClient(self: *Self, sock: posix.socket_t, client_ep: net.Address) !void {
         self.stats.total_connections += 1;
 
+        // ===== 第一步：检测是否是 TCP 端口探测请求 =====
+        // 端口探测请求是明文的，必须在 TLS 握手之前检测
+        // 使用 MSG_PEEK 窥视第一个字节，不消费数据
+        var peek_buf: [1]u8 = undefined;
+        const peek_len = posix.recv(sock, &peek_buf, std.posix.MSG.PEEK) catch |e| {
+            log.err("窥视首字节失败: {any}", .{e});
+            return;
+        };
+
+        if (peek_len >= 1 and peek_buf[0] == 0) {
+            // 这是端口探测请求，读取完整请求并处理
+            var probe_buf: [64]u8 = undefined;
+            const probe_len = posix.recv(sock, &probe_buf, 0) catch |e| {
+                log.err("读取端口探测请求失败: {any}", .{e});
+                return;
+            };
+            if (probe_len >= 2) {
+                const addr_str = log.formatAddress(client_ep);
+                log.info("收到 TCP 端口探测请求，来源: {s}", .{&addr_str});
+                self.handleTcpPortProbe(sock, client_ep, null);
+            }
+            return;
+        }
+
+        // ===== 第二步：不是端口探测，进行正常的 TLS 握手流程 =====
         // TLS 连接（堆分配，便于存储到 ClientInfo）
         var tls_conn_ptr: ?*tls.TlsConnection = null;
         defer {
@@ -1178,7 +1229,13 @@ pub const PunchServer = struct {
         if (payload.len < 2 + target_id_len) return;
         const target_id = payload[2 .. 2 + target_id_len];
 
-        log.info("转发端口请求: {s} -> {s}", .{ from_client.machine_id, target_id });
+        // 解析协议类型（可选，兼容旧协议）
+        var protocol_type: u8 = 0; // 默认 UDP
+        if (payload.len >= 2 + target_id_len + 1) {
+            protocol_type = payload[2 + target_id_len];
+        }
+
+        log.info("转发端口请求: {s} -> {s}, 协议类型: {d}", .{ from_client.machine_id, target_id, protocol_type });
 
         // 查找目标客户端
         self.clients_mutex.lock();
@@ -1192,7 +1249,7 @@ pub const PunchServer = struct {
 
         const target_client = target.?;
 
-        // 构建转发消息：将请求者 ID 放入 payload
+        // 构建转发消息：将请求者 ID 和协议类型放入 payload
         var forward_buf: [256]u8 = undefined;
         var forward_stream = std.io.fixedBufferStream(&forward_buf);
         const writer = forward_stream.writer();
@@ -1200,6 +1257,9 @@ pub const PunchServer = struct {
         // 请求者 ID
         try writer.writeInt(u16, @intCast(from_client.machine_id.len), .big);
         try writer.writeAll(from_client.machine_id);
+
+        // 协议类型
+        try writer.writeByte(protocol_type);
 
         const forward_payload = forward_stream.getWritten();
 
@@ -1221,7 +1281,7 @@ pub const PunchServer = struct {
 
         try target_client.sendData(send_buf[0..total_len]);
 
-        log.debug("已转发端口请求到 {s}", .{target_id});
+        log.debug("已转发端口请求到 {s}, 协议类型: {d}", .{ target_id, protocol_type });
     }
 
     /// 处理端口响应转发

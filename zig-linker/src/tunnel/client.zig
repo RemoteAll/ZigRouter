@@ -178,6 +178,13 @@ pub const PunchClient = struct {
     /// 注册时创建，打洞时复用，保证端口与公网映射一致
     udp_punch_socket: ?posix.socket_t = null,
 
+    /// TCP 打洞本地地址（用于 TCP NAT 打洞）
+    /// 这是通过 TCP 探测时获取的本地地址，端口与 NAT 映射对应
+    tcp_local_addr: ?net.Address = null,
+
+    /// TCP 打洞公网地址
+    tcp_public_addr: ?net.Address = null,
+
     /// 是否已注册
     registered: bool = false,
 
@@ -815,6 +822,29 @@ pub const PunchClient = struct {
         });
     }
 
+    /// 刷新 TCP 端口
+    /// 重新进行 TCP 探测以获取最新的公网映射端口
+    /// 在 TCP 打洞前调用，确保使用最新的端口信息
+    pub fn refreshTcpPort(self: *Self) !void {
+        log.debug("刷新 TCP 端口...", .{});
+
+        const result = try self.getExternalAddrFromLinkerTcp();
+
+        // 更新 TCP 本地和公网地址
+        self.tcp_local_addr = result.local_addr;
+        self.tcp_public_addr = result.public_addr;
+
+        var local_buf: [64]u8 = undefined;
+        var public_buf: [64]u8 = undefined;
+        log.info("TCP 端口刷新完成: 本地={s}, 公网={s}", .{
+            formatAddress(result.local_addr, &local_buf),
+            if (result.public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
+        });
+
+        // 关闭探测时创建的 socket（端口已经被 NAT 记录）
+        posix.close(result.socket);
+    }
+
     /// 通过 Linker 服务端 UDP 获取公网地址
     /// 返回公网地址、本地 UDP 地址，并保存 UDP socket 用于打洞
     const LinkerExternalResult = struct {
@@ -966,6 +996,164 @@ pub const PunchClient = struct {
         posix.close(udp_sock);
         log.warn("UDP 探测失败：服务端可能未开启 UDP 端口 {d}", .{self.config.server_port});
         return error.ConnectionTimedOut;
+    }
+
+    /// TCP 端口探测结果
+    const TcpExternalResult = struct {
+        public_addr: ?net.Address,
+        local_addr: net.Address, // TCP socket 的本地地址（包含正确的打洞端口）
+        socket: posix.socket_t, // 保持 socket 打开以复用端口
+    };
+
+    /// 通过 TCP 连接到 Linker 服务端获取公网地址
+    /// 与 UDP 探测类似，但使用 TCP 协议，适用于 TCP 打洞场景
+    /// 返回的 socket 需要在打洞时复用（使用相同的本地端口）
+    fn getExternalAddrFromLinkerTcp(self: *Self) !TcpExternalResult {
+        log.info("开始 TCP 端口探测，服务器: {s}:{d}", .{ self.config.server_addr, self.config.server_port });
+
+        // 创建 TCP socket（启用端口复用）
+        const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch |e| {
+            log.err("创建 TCP socket 失败: {any}", .{e});
+            return error.SocketCreateFailed;
+        };
+        errdefer posix.close(sock);
+
+        // 设置端口复用
+        net_utils.setReuseAddr(sock, true) catch {};
+        net_utils.setReusePort(sock, true) catch {};
+
+        // 绑定到任意端口（系统分配）
+        const local_bind = net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+        posix.bind(sock, &local_bind.any, local_bind.getOsSockLen()) catch |e| {
+            log.err("TCP bind 失败: {any}", .{e});
+            return error.BindFailed;
+        };
+
+        // 服务器地址
+        const server_addr = try net.Address.parseIp4(self.config.server_addr, self.config.server_port);
+
+        // 连接到服务器
+        posix.connect(sock, &server_addr.any, server_addr.getOsSockLen()) catch |e| {
+            log.err("TCP 连接服务器失败: {any}", .{e});
+            return error.ConnectFailed;
+        };
+
+        // 设置接收超时
+        if (@import("builtin").os.tag == .windows) {
+            const timeout_ms: i32 = 5000;
+            posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms)) catch {};
+        } else {
+            const timeout = posix.timeval{ .sec = 5, .usec = 0 };
+            posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        }
+
+        // 构建探测请求：[0x00][序号][随机数据]
+        var request: [64]u8 = undefined;
+        request[0] = 0; // 消息类型：端口探测
+        request[1] = 0; // 序号
+
+        // 填充随机数据
+        var rng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp()));
+        const random = rng.random();
+        for (2..request.len) |i| {
+            request[i] = random.int(u8);
+        }
+
+        // 发送请求
+        _ = posix.send(sock, &request, 0) catch |e| {
+            log.err("TCP 端口探测发送失败: {any}", .{e});
+            return error.SendFailed;
+        };
+
+        // 接收响应
+        var response: [128]u8 = undefined;
+        const recv_len = posix.recv(sock, &response, 0) catch |e| {
+            log.err("TCP 端口探测接收失败: {any}", .{e});
+            return error.RecvFailed;
+        };
+
+        if (recv_len < 7) {
+            log.warn("TCP 端口探测响应长度不足: {d}", .{recv_len});
+            return error.InvalidResponse;
+        }
+
+        // 解析响应（数据已与 0xFF 异或）
+        for (0..recv_len) |i| {
+            response[i] = response[i] ^ 0xFF;
+        }
+
+        // 解析地址族
+        const family: u16 = response[0];
+        var public_addr: net.Address = undefined;
+
+        if (family == posix.AF.INET) {
+            // IPv4: [family(1)][ip(4)][port(2)]
+            const ip_bytes = response[1..5];
+            const port_bytes = response[5..7];
+            const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
+            public_addr = net.Address.initIp4(ip_bytes[0..4].*, port);
+        } else if (family == posix.AF.INET6) {
+            // IPv6: [family(1)][ip(16)][port(2)]
+            if (recv_len < 19) {
+                log.warn("IPv6 响应长度不足", .{});
+                return error.InvalidResponse;
+            }
+            const port_bytes = response[17..19];
+            const port = (@as(u16, port_bytes[0]) << 8) | @as(u16, port_bytes[1]);
+            public_addr = net.Address.initIp6(response[1..17].*, port, 0, 0);
+        } else {
+            log.warn("不支持的地址族: {d}", .{family});
+            return error.InvalidResponse;
+        }
+
+        // 获取本地地址（包含系统分配的端口）
+        var local_sockaddr: posix.sockaddr = undefined;
+        var local_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        try posix.getsockname(sock, &local_sockaddr, &local_len);
+        var local_tcp_addr = net.Address{ .any = local_sockaddr };
+
+        // 获取实际的本机出口 IP
+        if (net_utils.getLocalOutboundAddress()) |outbound_addr| {
+            const tcp_port = local_tcp_addr.getPort();
+            local_tcp_addr = net.Address.initIp4(
+                @as(*const [4]u8, @ptrCast(&outbound_addr.in.sa.addr)).*,
+                tcp_port,
+            );
+        }
+
+        var local_addr_buf: [64]u8 = undefined;
+        var public_addr_buf: [64]u8 = undefined;
+        log.info("TCP 端口探测成功! 本地: {s}, 公网: {s}", .{
+            formatAddress(local_tcp_addr, &local_addr_buf),
+            formatAddress(public_addr, &public_addr_buf),
+        });
+
+        // 关闭这个探测用的连接（但记住端口号）
+        posix.close(sock);
+
+        // 创建新的 socket 绑定到同一端口，用于后续打洞
+        const punch_sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch |e| {
+            log.err("创建 TCP 打洞 socket 失败: {any}", .{e});
+            return error.SocketCreateFailed;
+        };
+        errdefer posix.close(punch_sock);
+
+        // 设置端口复用
+        net_utils.setReuseAddr(punch_sock, true) catch {};
+        net_utils.setReusePort(punch_sock, true) catch {};
+
+        // 绑定到探测时使用的同一端口
+        const bind_addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, local_tcp_addr.getPort());
+        posix.bind(punch_sock, &bind_addr.any, bind_addr.getOsSockLen()) catch |e| {
+            log.warn("TCP 打洞 socket bind 到端口 {d} 失败: {any}", .{ local_tcp_addr.getPort(), e });
+            // 即使 bind 失败也返回结果，让调用方决定
+        };
+
+        return TcpExternalResult{
+            .public_addr = public_addr,
+            .local_addr = local_tcp_addr,
+            .socket = punch_sock,
+        };
     }
 
     /// 注册到服务器
@@ -1569,14 +1757,36 @@ pub const PunchClient = struct {
         log.info("╚══════════════════════════════════════════════════════════════╝", .{});
 
         // 第一步：刷新本地 UDP 端口
-        log.info("步骤 1/3: 刷新本地 UDP 端口...", .{});
-        self.refreshUdpPort() catch |e| {
-            log.warn("刷新本地端口失败: {any}，使用已有端口", .{e});
-        };
+        // 第一步：根据传输类型刷新本地端口
+        var local_endpoint: ?net.Address = null;
+        var public_endpoint: ?net.Address = null;
 
-        // 保存当前端口状态
-        const local_endpoint = self.udp_local_addr;
-        const public_endpoint = self.public_addr;
+        if (transport.protocolType() == .tcp) {
+            // TCP 传输：使用 TCP 端口探测
+            log.info("步骤 1/3: 刷新本地 TCP 端口...", .{});
+            self.refreshTcpPort() catch |e| {
+                log.err("刷新 TCP 端口失败: {any}", .{e});
+                log.err("TCP P2P NAT 打洞需要服务端支持 TCP 端口探测", .{});
+                log.err("请确保服务端已更新到支持 TCP 端口探测的版本", .{});
+                return error.TcpPortProbeFailed;
+            };
+            local_endpoint = self.tcp_local_addr;
+            public_endpoint = self.tcp_public_addr;
+
+            // 验证 TCP 端口探测结果
+            if (local_endpoint == null or public_endpoint == null) {
+                log.err("TCP 端口探测未返回有效地址", .{});
+                return error.TcpPortProbeFailed;
+            }
+        } else {
+            // UDP 传输：使用 UDP 端口探测
+            log.info("步骤 1/3: 刷新本地 UDP 端口...", .{});
+            self.refreshUdpPort() catch |e| {
+                log.warn("刷新 UDP 端口失败: {any}，使用已有端口", .{e});
+            };
+            local_endpoint = self.udp_local_addr;
+            public_endpoint = self.public_addr;
+        }
 
         var local_buf: [64]u8 = undefined;
         var public_buf: [64]u8 = undefined;
@@ -1622,7 +1832,9 @@ pub const PunchClient = struct {
         }
 
         // 第三步：发送获取远程端口请求
-        try self.sendGetWanPortRequest(target_machine_id);
+        // 根据传输类型确定协议类型: 0=UDP, 1=TCP
+        const protocol_type: u8 = if (transport.protocolType() == .tcp) 1 else 0;
+        try self.sendGetWanPortRequest(target_machine_id, protocol_type);
 
         log.info("步骤 3/3: 等待目标端口响应...", .{});
         log.info("（响应后将在消息循环中自动继续打洞流程）", .{});
@@ -1630,10 +1842,11 @@ pub const PunchClient = struct {
 
     /// 发送获取远程端口请求
     /// 在打洞前调用，让目标刷新端口并返回最新端口信息
-    pub fn sendGetWanPortRequest(self: *Self, target_machine_id: []const u8) !void {
+    /// protocol_type: 0=UDP, 1=TCP - 告诉对方用什么协议探测端口
+    pub fn sendGetWanPortRequest(self: *Self, target_machine_id: []const u8, protocol_type: u8) !void {
         if (self.server_socket == null) return error.NotConnected;
 
-        // 构建请求 payload: 目标机器 ID
+        // 构建请求 payload: 目标机器 ID + 协议类型
         var payload_buf: [256]u8 = undefined;
         var payload_stream = std.io.fixedBufferStream(&payload_buf);
         const writer = payload_stream.writer();
@@ -1641,6 +1854,9 @@ pub const PunchClient = struct {
         // 目标机器 ID (2 bytes length + data)
         try writer.writeInt(u16, @intCast(target_machine_id.len), .big);
         try writer.writeAll(target_machine_id);
+
+        // 协议类型 (1 byte): 0=UDP, 1=TCP
+        try writer.writeByte(protocol_type);
 
         const payload = payload_stream.getWritten();
 
@@ -1668,22 +1884,56 @@ pub const PunchClient = struct {
             _ = try posix.send(self.server_socket.?, send_buf[0..total_len], 0);
         }
 
-        log.debug("已发送获取远程端口请求，目标: {s}", .{target_machine_id});
+        log.debug("已发送获取远程端口请求，目标: {s}, 协议类型: {d}", .{ target_machine_id, protocol_type });
     }
 
     /// 发送获取端口响应（当被请求时调用）
     /// 刷新本地端口并返回最新端口信息
-    pub fn sendGetWanPortResponse(self: *Self, requester_id: []const u8) !void {
+    /// protocol_type: 0=UDP, 1=TCP - 根据对方需要的协议类型刷新对应端口
+    pub fn sendGetWanPortResponse(self: *Self, requester_id: []const u8, protocol_type: u8) !void {
         if (self.server_socket == null) return error.NotConnected;
 
-        // 刷新本地端口
-        self.refreshUdpPort() catch |e| {
-            log.warn("刷新 UDP 端口失败: {any}", .{e});
-        };
+        // 根据协议类型刷新对应端口
+        var local_addr: ?net.Address = null;
+        var public_addr: ?net.Address = null;
 
-        // 获取最新端口信息
-        const local_addr = self.udp_local_addr orelse self.local_addr;
-        const public_addr = self.public_addr;
+        if (protocol_type == 1) {
+            // TCP 协议 - 刷新 TCP 端口
+            self.refreshTcpPort() catch |e| {
+                log.err("刷新 TCP 端口失败: {any}", .{e});
+                log.err("无法响应 TCP 端口查询，服务端可能不支持 TCP 端口探测", .{});
+                return error.TcpPortProbeFailed;
+            };
+            local_addr = self.tcp_local_addr;
+            public_addr = self.tcp_public_addr;
+
+            // 验证 TCP 端口探测结果
+            if (local_addr == null or public_addr == null) {
+                log.err("TCP 端口探测未返回有效地址", .{});
+                return error.TcpPortProbeFailed;
+            }
+
+            var local_buf: [64]u8 = undefined;
+            var public_buf: [64]u8 = undefined;
+            log.info("使用 TCP 端口响应: 本地={s}, 公网={s}", .{
+                if (local_addr) |la| formatAddress(la, &local_buf) else "未知",
+                if (public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
+            });
+        } else {
+            // UDP 协议（默认） - 刷新 UDP 端口
+            self.refreshUdpPort() catch |e| {
+                log.warn("刷新 UDP 端口失败: {any}", .{e});
+            };
+            local_addr = self.udp_local_addr orelse self.local_addr;
+            public_addr = self.public_addr;
+
+            var local_buf: [64]u8 = undefined;
+            var public_buf: [64]u8 = undefined;
+            log.info("使用 UDP 端口响应: 本地={s}, 公网={s}", .{
+                if (local_addr) |la| formatAddress(la, &local_buf) else "未知",
+                if (public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
+            });
+        }
 
         // 构建响应 payload
         var payload_buf: [512]u8 = undefined;
@@ -1732,7 +1982,12 @@ pub const PunchClient = struct {
             _ = try posix.send(self.server_socket.?, send_buf[0..total_len], 0);
         }
 
-        log.info("已发送端口响应给 {s}: 本地={s}, 公网={s}", .{ requester_id, local_str, public_str });
+        log.info("已发送端口响应给 {s}: 本地={s}, 公网={s}, 协议={s}", .{
+            requester_id,
+            local_str,
+            public_str,
+            if (protocol_type == 1) "TCP" else "UDP",
+        });
     }
 
     /// 发送包含双方端口信息的打洞开始消息
@@ -2273,10 +2528,16 @@ pub const PunchClient = struct {
                     if (loop_payload.len < 2 + requester_id_len) continue;
                     const requester_id = loop_payload[2 .. 2 + requester_id_len];
 
-                    log.info("收到端口查询请求，来自: {s}", .{requester_id});
+                    // 解析协议类型（可选，兼容旧协议）
+                    var protocol_type: u8 = 0; // 默认 UDP
+                    if (loop_payload.len >= 2 + requester_id_len + 1) {
+                        protocol_type = loop_payload[2 + requester_id_len];
+                    }
 
-                    // 发送端口响应（会自动刷新端口）
-                    self.sendGetWanPortResponse(requester_id) catch |e| {
+                    log.info("收到端口查询请求，来自: {s}, 协议类型: {d}", .{ requester_id, protocol_type });
+
+                    // 发送端口响应（根据协议类型刷新对应端口）
+                    self.sendGetWanPortResponse(requester_id, protocol_type) catch |e| {
                         log.err("发送端口响应失败: {any}", .{e});
                     };
                 },
