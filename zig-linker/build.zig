@@ -102,11 +102,61 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // ====== 打洞服务端可执行文件 ======
+    // 服务端可选使用兼容 CPU 特性，确保在各种服务器（包括老旧 VPS）上兼容运行
+    // 使用 -Dserver-compat=true 启用兼容模式，避免 "Illegal instruction" 错误
+    //
+    // 兼容性级别说明：
+    //   不指定 (默认)     : 使用本机 CPU 全部特性，性能最佳
+    //   -Dserver-compat=true : 禁用 AVX/AVX2/AVX512，保留 SSE4/AES-NI（2010 年后 CPU 通常支持）
+    //   -Dserver-baseline=true : 最大兼容模式，禁用所有高级特性（适合非常老旧的 VPS）
+    const server_compat = b.option(bool, "server-compat", "禁用 AVX/AVX512，保留 SSE4/AES-NI，适合大多数云服务器") orelse false;
+    const server_baseline = b.option(bool, "server-baseline", "最大兼容模式，禁用所有高级 CPU 特性，适合非常老旧的 VPS") orelse false;
+
+    const server_target = blk: {
+        if (server_baseline) {
+            // 最大兼容模式：禁用所有高级特性
+            // 性能影响：TLS 加密性能下降 3-10 倍
+            var query = target.query;
+            query.cpu_features_sub = std.Target.x86.featureSet(&.{
+                .avx,
+                .avx2,
+                .avx512f,
+                .avx512bw,
+                .avx512cd,
+                .avx512dq,
+                .avx512vl,
+                .aes,
+                .pclmul,
+                .sse4_1,
+                .sse4_2,
+                .ssse3,
+            });
+            break :blk b.resolveTargetQuery(query);
+        } else if (server_compat) {
+            // 常规兼容模式：只禁用 AVX 系列，保留 SSE4/AES-NI
+            // 2010 年后的 Intel (Westmere+) 和 AMD (Bulldozer+) CPU 通常都支持
+            // 性能影响：较小，TLS 性能基本无损
+            var query = target.query;
+            query.cpu_features_sub = std.Target.x86.featureSet(&.{
+                .avx,
+                .avx2,
+                .avx512f,
+                .avx512bw,
+                .avx512cd,
+                .avx512dq,
+                .avx512vl,
+            });
+            break :blk b.resolveTargetQuery(query);
+        } else {
+            break :blk target;
+        }
+    };
+
     const server_exe = b.addExecutable(.{
         .name = "punch_server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tunnel/server.zig"),
-            .target = target,
+            .target = server_target,
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{

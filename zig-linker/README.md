@@ -163,8 +163,40 @@ src/
 
 ## 编译
 
+### 本地开发
+
 ```bash
 zig build
+```
+
+### 部署到公网服务器
+
+公网服务器（VPS/云主机）的 CPU 可能不支持某些高级指令集，导致运行时出现 "Illegal instruction" 错误。根据服务器 CPU 选择合适的兼容级别：
+
+| 编译选项 | 适用场景 | 性能影响 |
+|---------|---------|---------|
+| 无选项（默认） | 本机运行、已知 CPU 支持 | 最佳性能 |
+| `-Dserver-compat=true` | **大多数云服务器（推荐）** | 几乎无影响 |
+| `-Dserver-baseline=true` | 非常老旧的 VPS | TLS 性能下降 3-10 倍 |
+
+```bash
+# 推荐：适合大多数云服务器（2010 年后的 CPU）
+# 禁用 AVX/AVX2/AVX512，保留 SSE4/AES-NI
+zig build -Dserver-compat=true -Doptimize=ReleaseSafe
+
+# 最大兼容：适合非常老旧的 VPS 或特殊虚拟化环境
+# 禁用所有高级 CPU 特性
+zig build -Dserver-baseline=true -Doptimize=ReleaseSafe
+```
+
+> **建议**：先尝试 `-Dserver-compat=true`，如果仍然报错再使用 `-Dserver-baseline=true`。
+
+### 交叉编译（Linux x86_64）
+
+如果在 Windows 上编译部署到 Linux 服务器：
+
+```bash
+zig build -Dtarget=x86_64-linux-gnu -Dserver-compat=true -Doptimize=ReleaseSafe
 ```
 
 生成的可执行文件位于 `zig-out/bin/`：
