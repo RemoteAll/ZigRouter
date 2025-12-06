@@ -55,6 +55,54 @@ fn parseEndpointString(endpoint_str: []const u8) ?net.Address {
     return null;
 }
 
+const builtin = @import("builtin");
+
+/// 获取本地时区偏移量（秒）
+/// 返回本地时间相对于 UTC 的偏移秒数（例如 UTC+8 返回 28800）
+fn getLocalTimezoneOffset() i64 {
+    if (builtin.os.tag == .windows) {
+        // Windows: 使用 GetTimeZoneInformation API
+        const LONG = i32;
+        const WCHAR = u16;
+
+        const SYSTEMTIME = extern struct {
+            wYear: u16,
+            wMonth: u16,
+            wDayOfWeek: u16,
+            wDay: u16,
+            wHour: u16,
+            wMinute: u16,
+            wSecond: u16,
+            wMilliseconds: u16,
+        };
+
+        const TIME_ZONE_INFORMATION = extern struct {
+            Bias: LONG,
+            StandardName: [32]WCHAR,
+            StandardDate: SYSTEMTIME,
+            StandardBias: LONG,
+            DaylightName: [32]WCHAR,
+            DaylightDate: SYSTEMTIME,
+            DaylightBias: LONG,
+        };
+
+        const GetTimeZoneInformation = struct {
+            extern "kernel32" fn GetTimeZoneInformation(lpTimeZoneInformation: *TIME_ZONE_INFORMATION) u32;
+        }.GetTimeZoneInformation;
+
+        var tzi: TIME_ZONE_INFORMATION = undefined;
+        _ = GetTimeZoneInformation(&tzi);
+
+        // Bias 是以分钟为单位的偏移，且是负值（例如 UTC+8 返回 -480）
+        // 需要转换为秒并反转符号
+        return -tzi.Bias * 60;
+    } else {
+        // Unix/Linux: 简化处理，默认使用 UTC+8（中国标准时间）
+        // 实际项目中可以读取 TZ 环境变量或 /etc/timezone
+        return 8 * 3600;
+    }
+}
+
 /// 客户端配置
 pub const ClientConfig = struct {
     /// 服务器地址
@@ -1770,6 +1818,43 @@ pub const PunchClient = struct {
                         const local_time = std.time.milliTimestamp();
                         const new_offset = server_time - local_time;
 
+                        // 获取本地时区偏移（秒），用于转换为本地时间显示
+                        const tz_offset_secs = getLocalTimezoneOffset();
+
+                        // 转换为可读的本地时区时间格式
+                        const local_timestamp_secs: i64 = @intCast(@divTrunc(local_time, 1000));
+                        const server_timestamp_secs: i64 = @intCast(@divTrunc(server_time, 1000));
+
+                        // 应用时区偏移
+                        const local_adjusted: u64 = @intCast(local_timestamp_secs + tz_offset_secs);
+                        const server_adjusted: u64 = @intCast(server_timestamp_secs + tz_offset_secs);
+
+                        const local_epoch = std.time.epoch.EpochSeconds{ .secs = local_adjusted };
+                        const server_epoch = std.time.epoch.EpochSeconds{ .secs = server_adjusted };
+                        const local_year_day = local_epoch.getEpochDay().calculateYearDay();
+                        const server_year_day = server_epoch.getEpochDay().calculateYearDay();
+                        const local_month_day = local_year_day.calculateMonthDay();
+                        const server_month_day = server_year_day.calculateMonthDay();
+                        const local_day_secs = local_epoch.getDaySeconds();
+                        const server_day_secs = server_epoch.getDaySeconds();
+
+                        // 每次收到心跳响应都打印时间对比信息（本地时区时间）
+                        log.info("心跳响应 - 本地时间: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}, 服务端时间: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}, 偏差: {d}ms", .{
+                            local_year_day.year,
+                            local_month_day.month.numeric(),
+                            local_month_day.day_index + 1,
+                            local_day_secs.getHoursIntoDay(),
+                            local_day_secs.getMinutesIntoHour(),
+                            local_day_secs.getSecondsIntoMinute(),
+                            server_year_day.year,
+                            server_month_day.month.numeric(),
+                            server_month_day.day_index + 1,
+                            server_day_secs.getHoursIntoDay(),
+                            server_day_secs.getMinutesIntoHour(),
+                            server_day_secs.getSecondsIntoMinute(),
+                            new_offset,
+                        });
+
                         // 如果是第一次同步，或者偏移量变化超过 100ms，则更新
                         if (!self.time_synced or @abs(new_offset - self.server_time_offset) > 100) {
                             self.server_time_offset = new_offset;
@@ -1778,7 +1863,7 @@ pub const PunchClient = struct {
                             // 同步日志模块的时间偏移
                             log.setServerTimeOffset(new_offset);
 
-                            log.debug("时间同步: 服务器时间={d}, 本地时间={d}, 偏移={d}ms", .{ server_time, local_time, new_offset });
+                            log.debug("时间同步更新: 新偏移={d}ms", .{new_offset});
                         }
                     }
                 },

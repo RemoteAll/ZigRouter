@@ -806,21 +806,37 @@ pub const PunchServer = struct {
         const addr1 = client1.public_addr orelse client1.local_addr;
         const addr2 = client2.public_addr orelse client2.local_addr;
 
+        // 添加调试日志
+        var addr1_buf: [64]u8 = undefined;
+        var addr2_buf: [64]u8 = undefined;
+        log.debug("isSameLan 检测: 客户端1={s}, 客户端2={s}", .{
+            ClientInfo.formatAddress(addr1, &addr1_buf),
+            ClientInfo.formatAddress(addr2, &addr2_buf),
+        });
+
         // 只比较 IP 地址，不比较端口
         if (addr1.any.family != addr2.any.family) {
+            log.debug("isSameLan: 地址族不同，返回 false", .{});
             return false;
         }
 
         switch (addr1.any.family) {
             posix.AF.INET => {
                 // IPv4: 比较 4 字节地址
-                return addr1.in.sa.addr == addr2.in.sa.addr;
+                const same = addr1.in.sa.addr == addr2.in.sa.addr;
+                log.debug("isSameLan: IPv4 比较结果={s}", .{if (same) "相同" else "不同"});
+                return same;
             },
             posix.AF.INET6 => {
                 // IPv6: 比较 16 字节地址
-                return std.mem.eql(u8, &addr1.in6.sa.addr, &addr2.in6.sa.addr);
+                const same = std.mem.eql(u8, &addr1.in6.sa.addr, &addr2.in6.sa.addr);
+                log.debug("isSameLan: IPv6 比较结果={s}", .{if (same) "相同" else "不同"});
+                return same;
             },
-            else => return false,
+            else => {
+                log.debug("isSameLan: 未知地址族，返回 false", .{});
+                return false;
+            },
         }
     }
 
