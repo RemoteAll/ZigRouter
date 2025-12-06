@@ -360,6 +360,108 @@ pub const PunchClient = struct {
         return self.time_synced;
     }
 
+    /// 同步时间：发送心跳并等待响应，获取服务器时间
+    /// 返回时间偏移量（毫秒），正值表示服务器时间比本地快
+    pub fn syncTime(self: *Self) !i64 {
+        const sock = self.server_socket orelse return error.NotConnected;
+
+        log.info("正在同步服务器时间...", .{});
+
+        // 发送心跳请求
+        const header = protocol.MessageHeader{
+            .magic = protocol.PROTOCOL_MAGIC,
+            .version = protocol.PROTOCOL_VERSION,
+            .msg_type = .heartbeat,
+            .data_length = 0,
+            .sequence = self.nextSequence(),
+        };
+
+        var buf: [protocol.MessageHeader.SIZE]u8 = undefined;
+        try header.serialize(&buf);
+
+        // 使用 TLS 或普通 socket 发送
+        if (self.tls_conn) |*tc| {
+            _ = try tc.send(&buf);
+        } else {
+            _ = try posix.send(sock, &buf, 0);
+        }
+
+        // 等待心跳响应
+        var recv_buf: [256]u8 = undefined;
+        const recv_len = if (self.tls_conn) |*tc| blk: {
+            break :blk try tc.recv(&recv_buf);
+        } else blk: {
+            break :blk try posix.recv(sock, &recv_buf, 0);
+        };
+
+        if (recv_len < protocol.MessageHeader.SIZE) {
+            return error.ProtocolError;
+        }
+
+        const resp_header = protocol.MessageHeader.parse(recv_buf[0..protocol.MessageHeader.SIZE]) catch return error.ProtocolError;
+
+        if (resp_header.msg_type != .heartbeat_response) {
+            log.warn("期望心跳响应，收到: {any}", .{resp_header.msg_type});
+            return error.UnexpectedResponse;
+        }
+
+        // 解析服务器时间
+        const hb_payload = recv_buf[protocol.MessageHeader.SIZE..recv_len];
+        if (hb_payload.len < 8) {
+            return error.InvalidPayload;
+        }
+
+        const server_time = std.mem.readInt(i64, hb_payload[0..8], .big);
+        const local_time = std.time.milliTimestamp();
+        const new_offset = server_time - local_time;
+
+        // 获取本地时区偏移（秒），用于转换为本地时间显示
+        const tz_offset_secs = getLocalTimezoneOffset();
+
+        // 转换为可读的本地时区时间格式
+        const local_timestamp_secs: i64 = @intCast(@divTrunc(local_time, 1000));
+        const server_timestamp_secs: i64 = @intCast(@divTrunc(server_time, 1000));
+
+        // 应用时区偏移
+        const local_adjusted: u64 = @intCast(local_timestamp_secs + tz_offset_secs);
+        const server_adjusted: u64 = @intCast(server_timestamp_secs + tz_offset_secs);
+
+        const local_epoch = std.time.epoch.EpochSeconds{ .secs = local_adjusted };
+        const server_epoch = std.time.epoch.EpochSeconds{ .secs = server_adjusted };
+        const local_year_day = local_epoch.getEpochDay().calculateYearDay();
+        const server_year_day = server_epoch.getEpochDay().calculateYearDay();
+        const local_month_day = local_year_day.calculateMonthDay();
+        const server_month_day = server_year_day.calculateMonthDay();
+        const local_day_secs = local_epoch.getDaySeconds();
+        const server_day_secs = server_epoch.getDaySeconds();
+
+        // 打印时间对比信息（本地时区时间）
+        log.info("时间同步完成 - 本地时间: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}, 服务端时间: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}, 偏差: {d}ms", .{
+            local_year_day.year,
+            local_month_day.month.numeric(),
+            local_month_day.day_index + 1,
+            local_day_secs.getHoursIntoDay(),
+            local_day_secs.getMinutesIntoHour(),
+            local_day_secs.getSecondsIntoMinute(),
+            server_year_day.year,
+            server_month_day.month.numeric(),
+            server_month_day.day_index + 1,
+            server_day_secs.getHoursIntoDay(),
+            server_day_secs.getMinutesIntoHour(),
+            server_day_secs.getSecondsIntoMinute(),
+            new_offset,
+        });
+
+        // 更新时间同步状态
+        self.server_time_offset = new_offset;
+        self.time_synced = true;
+
+        // 同步日志模块的时间偏移
+        log.setServerTimeOffset(new_offset);
+
+        return new_offset;
+    }
+
     /// 关闭与指定节点的连接
     fn closeConnectionByMachineId(self: *Self, machine_id: []const u8) void {
         self.connections_mutex.lock();
@@ -2965,6 +3067,11 @@ pub fn main() !void {
     defer client.deinit();
 
     try client.connect();
+
+    // 同步服务器时间（在进行任何打洞操作之前）
+    _ = client.syncTime() catch |e| {
+        log.warn("时间同步失败: {any}，将继续运行但时间可能不准确", .{e});
+    };
 
     if (list_only) {
         // 只列出在线节点
