@@ -1182,6 +1182,13 @@ pub const PunchServer = struct {
         if (offset + remote_local_len > payload.len) return;
         const remote_local = payload[offset .. offset + remote_local_len];
 
+        // 调试日志：显示解析到的端点信息
+        log.info("打洞转发 - 原始数据:", .{});
+        log.info("  发起方公网(my_public): {s} (len={d})", .{ my_public, my_public_len });
+        log.info("  发起方本地(my_local): {s} (len={d})", .{ my_local, my_local_len });
+        log.info("  目标公网(remote_public): {s} (len={d})", .{ remote_public, remote_public_len });
+        log.info("  目标本地(remote_local): {s} (len={d})", .{ remote_local, remote_local_len });
+
         // 交换写入：对于目标来说，发起方的端点是"对方的"
         // 写入发起方的端点作为目标的"对方端点"
         try writer.writeInt(u16, @intCast(my_public_len), .big);
@@ -1194,6 +1201,12 @@ pub const PunchServer = struct {
         if (remote_public_len > 0) try writer.writeAll(remote_public);
         try writer.writeInt(u16, @intCast(remote_local_len), .big);
         if (remote_local_len > 0) try writer.writeAll(remote_local);
+
+        log.info("打洞转发 - 转发后数据 (目标视角):", .{});
+        log.info("  对方公网(remote): {s}", .{my_public});
+        log.info("  对方本地(remote): {s}", .{my_local});
+        log.info("  我方公网(my): {s}", .{remote_public});
+        log.info("  我方本地(my): {s}", .{remote_local});
 
         const forward_payload = forward_stream.getWritten();
 
