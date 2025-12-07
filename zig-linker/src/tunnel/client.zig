@@ -185,6 +185,10 @@ pub const PunchClient = struct {
     /// TCP 打洞公网地址
     tcp_public_addr: ?net.Address = null,
 
+    /// TCP 打洞 socket（保持 NAT 映射活跃）
+    /// 探测时创建，打洞时复用，保证端口与公网映射一致
+    tcp_punch_socket: ?posix.socket_t = null,
+
     /// 是否已注册
     registered: bool = false,
 
@@ -285,6 +289,12 @@ pub const PunchClient = struct {
         if (self.udp_punch_socket) |sock| {
             posix.close(sock);
             self.udp_punch_socket = null;
+        }
+
+        // 关闭 TCP 打洞 socket
+        if (self.tcp_punch_socket) |sock| {
+            posix.close(sock);
+            self.tcp_punch_socket = null;
         }
 
         self.disconnect();
@@ -825,8 +835,15 @@ pub const PunchClient = struct {
     /// 刷新 TCP 端口
     /// 重新进行 TCP 探测以获取最新的公网映射端口
     /// 在 TCP 打洞前调用，确保使用最新的端口信息
+    /// 探测 socket 会被保留以维持 NAT 映射
     pub fn refreshTcpPort(self: *Self) !void {
         log.debug("刷新 TCP 端口...", .{});
+
+        // 如果已有 TCP 打洞 socket，先关闭它
+        if (self.tcp_punch_socket) |old_sock| {
+            posix.close(old_sock);
+            self.tcp_punch_socket = null;
+        }
 
         const result = try self.getExternalAddrFromLinkerTcp();
 
@@ -834,15 +851,17 @@ pub const PunchClient = struct {
         self.tcp_local_addr = result.local_addr;
         self.tcp_public_addr = result.public_addr;
 
+        // 保存 TCP 探测 socket 以维持 NAT 映射
+        // TCP 不像 UDP，关闭 socket 后 NAT 映射会立即失效
+        // 因此必须保持 socket 打开直到打洞完成
+        self.tcp_punch_socket = result.socket;
+
         var local_buf: [64]u8 = undefined;
         var public_buf: [64]u8 = undefined;
-        log.info("TCP 端口刷新完成: 本地={s}, 公网={s}", .{
+        log.info("TCP 端口刷新完成: 本地={s}, 公网={s} (socket 已保留)", .{
             formatAddress(result.local_addr, &local_buf),
             if (result.public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
         });
-
-        // 关闭探测时创建的 socket（端口已经被 NAT 记录）
-        posix.close(result.socket);
     }
 
     /// 通过 Linker 服务端 UDP 获取公网地址
@@ -1128,31 +1147,16 @@ pub const PunchClient = struct {
             formatAddress(public_addr, &public_addr_buf),
         });
 
-        // 关闭这个探测用的连接（但记住端口号）
-        posix.close(sock);
-
-        // 创建新的 socket 绑定到同一端口，用于后续打洞
-        const punch_sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch |e| {
-            log.err("创建 TCP 打洞 socket 失败: {any}", .{e});
-            return error.SocketCreateFailed;
-        };
-        errdefer posix.close(punch_sock);
-
-        // 设置端口复用
-        net_utils.setReuseAddr(punch_sock, true) catch {};
-        net_utils.setReusePort(punch_sock, true) catch {};
-
-        // 绑定到探测时使用的同一端口
-        const bind_addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, local_tcp_addr.getPort());
-        posix.bind(punch_sock, &bind_addr.any, bind_addr.getOsSockLen()) catch |e| {
-            log.warn("TCP 打洞 socket bind 到端口 {d} 失败: {any}", .{ local_tcp_addr.getPort(), e });
-            // 即使 bind 失败也返回结果，让调用方决定
-        };
+        // 重要：不关闭探测 socket！
+        // TCP NAT 映射在 socket 关闭后会立即失效
+        // 保持探测 socket 打开以维持 NAT 映射
+        // 打洞时使用 SO_REUSEADDR + SO_REUSEPORT 创建新 socket 绑定同一端口
+        log.info("TCP 探测 socket 保持打开以维持 NAT 映射 (本地端口 {d})", .{local_tcp_addr.getPort()});
 
         return TcpExternalResult{
             .public_addr = public_addr,
             .local_addr = local_tcp_addr,
-            .socket = punch_sock,
+            .socket = sock, // 返回探测 socket，由调用方保持打开
         };
     }
 
@@ -2323,9 +2327,22 @@ pub const PunchClient = struct {
                         }
                     }
 
-                    // 如果消息中没有指定我方地址，使用当前已知地址
-                    const local_to_use = my_local_addr orelse self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
-                    const public_to_use = my_public_addr orelse self.public_addr;
+                    // 如果消息中没有指定我方地址，根据传输类型使用对应的已知地址
+                    // TCP 打洞使用 tcp_local_addr，UDP 打洞使用 udp_local_addr
+                    const local_to_use = my_local_addr orelse blk: {
+                        if (begin.transport.protocolType() == .tcp) {
+                            break :blk self.tcp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+                        } else {
+                            break :blk self.udp_local_addr orelse self.local_addr orelse net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+                        }
+                    };
+                    const public_to_use = my_public_addr orelse blk: {
+                        if (begin.transport.protocolType() == .tcp) {
+                            break :blk self.tcp_public_addr orelse self.public_addr;
+                        } else {
+                            break :blk self.public_addr;
+                        }
+                    };
 
                     // 构造传输信息
                     // direction 保持原样：forward 表示我是发起方，reverse 表示我是被动方
@@ -2386,6 +2403,15 @@ pub const PunchClient = struct {
                         log.info("远程端点: {s}", .{std.mem.sliceTo(&remote_addr_str, 0)});
                         log.info("方向: {s}", .{if (begin.direction == .forward) "正向 (我方主动)" else "反向 (我方被动)"});
                         log.info("==============================", .{});
+
+                        // 被动方打洞成功，关闭 TCP 探测 socket（不再需要维持 NAT 映射）
+                        if (begin.transport.protocolType() == .tcp) {
+                            if (self.tcp_punch_socket) |tcp_sock| {
+                                posix.close(tcp_sock);
+                                self.tcp_punch_socket = null;
+                                log.debug("被动方：已关闭 TCP 探测 socket", .{});
+                            }
+                        }
 
                         var mutable_conn = conn;
                         const hello_msg = "Hello";
@@ -2474,6 +2500,15 @@ pub const PunchClient = struct {
                         log.err("传输方式: {s}", .{begin.transport.description()});
                         log.err("耗时: {d} ms", .{duration});
                         log.err("==============================", .{});
+
+                        // 被动方打洞失败，也关闭 TCP 探测 socket
+                        if (begin.transport.protocolType() == .tcp) {
+                            if (self.tcp_punch_socket) |tcp_sock| {
+                                posix.close(tcp_sock);
+                                self.tcp_punch_socket = null;
+                                log.debug("被动方：已关闭 TCP 探测 socket", .{});
+                            }
+                        }
                     }
                 },
                 .peer_online => {
@@ -2675,6 +2710,15 @@ pub const PunchClient = struct {
                             log.info("方向: 正向 (我方主动)", .{});
                             log.info("==============================", .{});
 
+                            // 打洞成功，关闭 TCP 探测 socket（不再需要维持 NAT 映射）
+                            if (req.transport.protocolType() == .tcp) {
+                                if (self.tcp_punch_socket) |tcp_sock| {
+                                    posix.close(tcp_sock);
+                                    self.tcp_punch_socket = null;
+                                    log.debug("已关闭 TCP 探测 socket", .{});
+                                }
+                            }
+
                             var mutable_conn = conn;
                             var hello_recv_buf: [256]u8 = undefined;
 
@@ -2734,6 +2778,15 @@ pub const PunchClient = struct {
                             log.err("传输方式: {s}", .{req.transport.description()});
                             log.err("耗时: {d} ms", .{duration});
                             log.err("==============================", .{});
+
+                            // 打洞失败，也关闭 TCP 探测 socket
+                            if (req.transport.protocolType() == .tcp) {
+                                if (self.tcp_punch_socket) |tcp_sock| {
+                                    posix.close(tcp_sock);
+                                    self.tcp_punch_socket = null;
+                                    log.debug("已关闭 TCP 探测 socket", .{});
+                                }
+                            }
                         }
                     } else {
                         log.warn("未找到 {s} 的待处理打洞请求", .{source_id});
