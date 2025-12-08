@@ -57,6 +57,23 @@ fn parseEndpointString(endpoint_str: []const u8) ?net.Address {
 
 const builtin = @import("builtin");
 
+/// 从 net.Address 中提取 IP 地址字节（用于比较公网 IP 是否相同）
+/// 支持 IPv4 和 IPv6 地址
+fn getIpBytes(addr: net.Address) [16]u8 {
+    var result: [16]u8 = [_]u8{0} ** 16;
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            @memcpy(result[0..4], bytes);
+        },
+        posix.AF.INET6 => {
+            @memcpy(&result, &addr.in6.sa.addr);
+        },
+        else => {},
+    }
+    return result;
+}
+
 /// 获取本地时区偏移量（秒）
 /// 返回本地时间相对于 UTC 的偏移秒数（例如 UTC+8 返回 28800）
 fn getLocalTimezoneOffset() i64 {
@@ -1493,6 +1510,55 @@ pub const PunchClient = struct {
             return PunchResult{ .success = false, .error_message = "没有可用的对方端点" };
         }
 
+        // 解析对方的本地地址和公网地址
+        // remote_endpoints[0] = 对方的本地地址
+        // remote_endpoints[1] = 对方的公网地址
+        const remote_local_addr = remote_endpoints[0];
+        const remote_public_addr: ?net.Address = if (endpoint_count > 1) remote_endpoints[1] else null;
+
+        // C# Linker 逻辑：只有当双方公网 IP 相同时（同一局域网），才尝试连接对方的本地地址
+        // 参考 TunnelTransfer.cs 的 ParseRemoteEndPoint 方法
+        var filtered_endpoints: [4]net.Address = undefined;
+        var filtered_count: usize = 0;
+
+        const my_public_addr = self.public_addr;
+        const same_lan = if (my_public_addr != null and remote_public_addr != null) blk: {
+            // 比较双方的公网 IP 地址（不比较端口）
+            const my_ip = getIpBytes(my_public_addr.?);
+            const remote_ip = getIpBytes(remote_public_addr.?);
+            break :blk std.mem.eql(u8, &my_ip, &remote_ip);
+        } else false;
+
+        if (same_lan) {
+            log.info("检测到双方在同一局域网（公网 IP 相同），将尝试连接本地地址", .{});
+            // 同一局域网：先尝试本地地址，再尝试公网地址
+            filtered_endpoints[filtered_count] = remote_local_addr;
+            filtered_count += 1;
+            if (remote_public_addr) |pub_addr| {
+                filtered_endpoints[filtered_count] = pub_addr;
+                filtered_count += 1;
+            }
+        } else {
+            log.info("检测到双方在不同网络（公网 IP 不同），只尝试连接公网地址", .{});
+            // 不同网络：只尝试公网地址
+            if (remote_public_addr) |pub_addr| {
+                filtered_endpoints[filtered_count] = pub_addr;
+                filtered_count += 1;
+            } else {
+                // 如果没有公网地址，退回到本地地址（应该不会发生）
+                log.warn("没有公网地址，退回到使用本地地址", .{});
+                filtered_endpoints[filtered_count] = remote_local_addr;
+                filtered_count += 1;
+            }
+        }
+
+        // 打印过滤后的端点列表
+        log.info("过滤后的目标端点数量: {d}", .{filtered_count});
+        for (filtered_endpoints[0..filtered_count], 0..) |ep, i| {
+            const ep_str = log.formatAddress(ep);
+            log.info("  过滤后端点 [{d}]: {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+        }
+
         // 构造传输信息
         const transport_info = types.TunnelTransportInfo{
             .flow_id = begin.flow_id,
@@ -1511,12 +1577,12 @@ pub const PunchClient = struct {
                 .machine_id = begin.source_machine_id,
                 .machine_name = "",
                 .nat_type = begin.source_nat_type,
-                .local = remote_endpoints[0],
-                .remote = if (endpoint_count > 1) remote_endpoints[1] else null,
+                .local = remote_local_addr,
+                .remote = remote_public_addr,
                 .port_map_wan = 0,
                 .route_level = 8,
             },
-            .remote_endpoints = remote_endpoints[0..endpoint_count],
+            .remote_endpoints = filtered_endpoints[0..filtered_count],
             .ssl = false,
         };
 
@@ -1586,6 +1652,47 @@ pub const PunchClient = struct {
             if (public_addr) |pa| formatAddress(pa, &public_buf) else "未知",
         });
 
+        // 解析对方的本地地址和公网地址
+        const remote_local_addr = if (remote_endpoints.len > 0) remote_endpoints[0] else net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+        const remote_public_addr: ?net.Address = if (remote_endpoints.len > 1) remote_endpoints[1] else null;
+
+        // C# Linker 逻辑：只有当双方公网 IP 相同时（同一局域网），才尝试连接对方的本地地址
+        var filtered_endpoints: [4]net.Address = undefined;
+        var filtered_count: usize = 0;
+
+        const same_lan = if (public_addr != null and remote_public_addr != null) blk: {
+            const my_ip = getIpBytes(public_addr.?);
+            const remote_ip = getIpBytes(remote_public_addr.?);
+            break :blk std.mem.eql(u8, &my_ip, &remote_ip);
+        } else false;
+
+        if (same_lan) {
+            log.info("检测到双方在同一局域网（公网 IP 相同），将尝试连接本地地址", .{});
+            filtered_endpoints[filtered_count] = remote_local_addr;
+            filtered_count += 1;
+            if (remote_public_addr) |pub_addr| {
+                filtered_endpoints[filtered_count] = pub_addr;
+                filtered_count += 1;
+            }
+        } else {
+            log.info("检测到双方在不同网络（公网 IP 不同），只尝试连接公网地址", .{});
+            if (remote_public_addr) |pub_addr| {
+                filtered_endpoints[filtered_count] = pub_addr;
+                filtered_count += 1;
+            } else {
+                log.warn("没有公网地址，退回到使用本地地址", .{});
+                filtered_endpoints[filtered_count] = remote_local_addr;
+                filtered_count += 1;
+            }
+        }
+
+        // 打印过滤后的端点列表
+        log.info("过滤后的目标端点数量: {d}", .{filtered_count});
+        for (filtered_endpoints[0..filtered_count], 0..) |ep, i| {
+            const ep_str = log.formatAddress(ep);
+            log.info("  过滤后端点 [{d}]: {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+        }
+
         // 构造传输信息 (注意方向是反的)
         const transport_info = types.TunnelTransportInfo{
             .flow_id = begin.flow_id,
@@ -1604,12 +1711,12 @@ pub const PunchClient = struct {
                 .machine_id = begin.source_machine_id,
                 .machine_name = "",
                 .nat_type = begin.source_nat_type,
-                .local = if (remote_endpoints.len > 0) remote_endpoints[0] else net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
-                .public = if (remote_endpoints.len > 1) remote_endpoints[1] else null,
+                .local = remote_local_addr,
+                .public = remote_public_addr,
                 .port_map_wan = 0,
                 .route_level = 8,
             },
-            .remote_endpoints = remote_endpoints,
+            .remote_endpoints = filtered_endpoints[0..filtered_count],
             .ssl = false,
         };
 
@@ -2322,6 +2429,50 @@ pub const PunchClient = struct {
                         }
                     };
 
+                    // 解析对方的本地地址和公网地址
+                    const remote_local_addr = remote_endpoints[0];
+                    const remote_public_addr: ?net.Address = if (endpoint_count > 1) remote_endpoints[1] else null;
+
+                    // C# Linker 逻辑：只有当双方公网 IP 相同时（同一局域网），才尝试连接对方的本地地址
+                    var filtered_endpoints: [4]net.Address = undefined;
+                    var filtered_count: usize = 0;
+
+                    const same_lan_check = if (public_to_use != null and remote_public_addr != null) blk: {
+                        const my_ip = getIpBytes(public_to_use.?);
+                        const remote_ip = getIpBytes(remote_public_addr.?);
+                        break :blk std.mem.eql(u8, &my_ip, &remote_ip);
+                    } else false;
+
+                    // 如果消息中明确标记 same_lan，或者我们检测到公网 IP 相同，则认为是同一局域网
+                    const is_same_lan = begin.same_lan or same_lan_check;
+
+                    if (is_same_lan) {
+                        log.info("检测到双方在同一局域网，将尝试连接本地地址", .{});
+                        filtered_endpoints[filtered_count] = remote_local_addr;
+                        filtered_count += 1;
+                        if (remote_public_addr) |pub_addr| {
+                            filtered_endpoints[filtered_count] = pub_addr;
+                            filtered_count += 1;
+                        }
+                    } else {
+                        log.info("检测到双方在不同网络，只尝试连接公网地址", .{});
+                        if (remote_public_addr) |pub_addr| {
+                            filtered_endpoints[filtered_count] = pub_addr;
+                            filtered_count += 1;
+                        } else {
+                            log.warn("没有公网地址，退回到使用本地地址", .{});
+                            filtered_endpoints[filtered_count] = remote_local_addr;
+                            filtered_count += 1;
+                        }
+                    }
+
+                    // 打印过滤后的端点列表
+                    log.info("过滤后的目标端点数量: {d}", .{filtered_count});
+                    for (filtered_endpoints[0..filtered_count], 0..) |ep, i| {
+                        const ep_str = log.formatAddress(ep);
+                        log.info("  过滤后端点 [{d}]: {s}", .{ i, std.mem.sliceTo(&ep_str, 0) });
+                    }
+
                     // 构造传输信息
                     // direction 保持原样：forward 表示我是发起方，reverse 表示我是被动方
                     const transport_info = types.TunnelTransportInfo{
@@ -2344,14 +2495,14 @@ pub const PunchClient = struct {
                             .machine_id = begin.source_machine_id,
                             .machine_name = "",
                             .nat_type = begin.source_nat_type,
-                            .local = remote_endpoints[0],
+                            .local = remote_local_addr,
                             .local_ips = &.{},
-                            .remote = if (endpoint_count > 1) remote_endpoints[1] else null,
+                            .remote = remote_public_addr,
                             .port_map_wan = 0,
                             .port_map_lan = 0,
                             .route_level = 8,
                         },
-                        .remote_endpoints = remote_endpoints[0..endpoint_count],
+                        .remote_endpoints = filtered_endpoints[0..filtered_count],
                         .ssl = begin.ssl,
                     };
 
