@@ -2602,6 +2602,11 @@ pub const PunchClient = struct {
                             continue;
                         };
 
+                        // 重要：发送 Begin 消息后等待一小段时间，让被动方有时间收到消息并准备好
+                        // 这对 TCP 同时打开非常关键，两边需要几乎同时发送 SYN
+                        // C# Linker 在 Reverse 方向时也有类似的 50ms 延迟
+                        std.Thread.sleep(50 * std.time.ns_per_ms);
+
                         // 发起方自己也要开始打洞！
                         // 构造远程端点列表
                         var remote_endpoints: [2]net.Address = undefined;
