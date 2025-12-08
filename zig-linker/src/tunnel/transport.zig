@@ -841,6 +841,15 @@ pub const TransportTcpP2PNAT = struct {
         log.logPunchStart(.tcp_p2p_nat, info.direction, info.local, info.remote);
 
         const mode: types.TunnelMode = if (info.direction == .forward) .client else .server;
+
+        // 与 C# TransportTcpP2PNAT 行为保持一致：
+        // 当方向为 Reverse（被动方）时，在真正开始同时打开前延迟 50ms，
+        // 让另一侧先进入连接状态，有助于提高某些 NAT 组合下的成功率。
+        if (info.direction == .reverse) {
+            log.debug("TCP P2PNAT: Reverse 方向，延迟 50ms 再开始连接", .{});
+            std.Thread.sleep(50 * std.time.ms_per_s / 1000);
+        }
+
         return try self.connectForward(info, mode);
     }
 

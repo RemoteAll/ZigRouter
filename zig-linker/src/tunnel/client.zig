@@ -2825,7 +2825,7 @@ pub const PunchClient = struct {
                                     endpoint_count += 1;
                                 }
                             } else if (remote_local) |addr| {
-                                // 理论上不会发生，没有公网地址时兜底
+                                // 只有在没有公网地址时才兜底使用本地地址
                                 remote_endpoints[endpoint_count] = addr;
                                 endpoint_count += 1;
                             }
@@ -3148,8 +3148,8 @@ pub const PunchClient = struct {
                     remote_endpoints[remote_count] = pub_next;
                     remote_count += 1;
                 }
-            }
-            if (remote_local_addr) |addr| {
+            } else if (remote_local_addr) |addr| {
+                // 只有在没有公网地址时才兜底使用本地地址
                 remote_endpoints[remote_count] = addr;
                 remote_count += 1;
             }
