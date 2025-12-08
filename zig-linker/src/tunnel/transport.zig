@@ -960,17 +960,28 @@ pub const TransportTcpP2PNAT = struct {
         net_utils.setReuseAddr(sock, true) catch {};
         net_utils.setReusePort(sock, true) catch {};
 
-        // 绑定到与 UDP 相同的本地端口
+        // 绑定到指定的本地端口
         const bind_addr = if (family == posix.AF.INET)
             net.Address.initIp4(.{ 0, 0, 0, 0 }, local_port)
         else
             net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, local_port, 0, 0);
 
         posix.bind(sock, &bind_addr.any, bind_addr.getOsSockLen()) catch |e| {
-            log.info("TCP P2PNAT: bind 到端口 {d} 失败: {any}", .{ local_port, e });
+            log.warn("TCP P2PNAT: bind 到端口 {d} 失败: {any}", .{ local_port, e });
             posix.close(sock);
             return null;
         };
+
+        // 验证实际绑定的端口
+        var actual_addr: posix.sockaddr = undefined;
+        var actual_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        if (posix.getsockname(sock, &actual_addr, &actual_len)) |_| {
+            const bound_addr = net.Address{ .any = actual_addr };
+            const actual_port = bound_addr.getPort();
+            if (actual_port != local_port) {
+                log.warn("TCP P2PNAT: 实际绑定端口 {d} 与请求端口 {d} 不同!", .{ actual_port, local_port });
+            }
+        } else |_| {}
 
         // 设置 Keep-Alive
         net_utils.setKeepAlive(sock, true) catch {};
@@ -1037,7 +1048,10 @@ pub const TransportTcpP2PNAT = struct {
         };
 
         if (sock_err != 0) {
-            log.info("TCP P2PNAT: socket 错误: {d}", .{sock_err});
+            // 记录具体的 socket 错误码
+            // Windows: 10061=WSAECONNREFUSED, 10060=WSAETIMEDOUT, 10065=WSAEHOSTUNREACH
+            // Linux: 111=ECONNREFUSED, 110=ETIMEDOUT, 113=EHOSTUNREACH
+            log.info("TCP P2PNAT: socket 错误码: {d} (连接被拒绝/超时/不可达)", .{sock_err});
             posix.close(sock);
             return null;
         }
