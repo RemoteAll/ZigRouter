@@ -1531,12 +1531,19 @@ pub const PunchClient = struct {
 
         if (same_lan) {
             log.info("检测到双方在同一局域网（公网 IP 相同），将尝试连接本地地址", .{});
-            // 同一局域网：先尝试本地地址，再尝试公网地址
+            // 同一局域网：先尝试本地地址，再尝试公网地址及端口+1
             filtered_endpoints[filtered_count] = remote_local_addr;
             filtered_count += 1;
             if (remote_public_addr) |pub_addr| {
                 filtered_endpoints[filtered_count] = pub_addr;
                 filtered_count += 1;
+
+                if (filtered_count < filtered_endpoints.len) {
+                    var pub_next = pub_addr;
+                    pub_next.setPort(pub_addr.getPort() + 1);
+                    filtered_endpoints[filtered_count] = pub_next;
+                    filtered_count += 1;
+                }
             }
         } else {
             log.info("检测到双方在不同网络（公网 IP 不同），只尝试连接公网地址", .{});
@@ -1544,6 +1551,13 @@ pub const PunchClient = struct {
             if (remote_public_addr) |pub_addr| {
                 filtered_endpoints[filtered_count] = pub_addr;
                 filtered_count += 1;
+
+                if (filtered_count < filtered_endpoints.len) {
+                    var pub_next = pub_addr;
+                    pub_next.setPort(pub_addr.getPort() + 1);
+                    filtered_endpoints[filtered_count] = pub_next;
+                    filtered_count += 1;
+                }
             } else {
                 // 如果没有公网地址，退回到本地地址（应该不会发生）
                 log.warn("没有公网地址，退回到使用本地地址", .{});
@@ -2453,12 +2467,26 @@ pub const PunchClient = struct {
                         if (remote_public_addr) |pub_addr| {
                             filtered_endpoints[filtered_count] = pub_addr;
                             filtered_count += 1;
+
+                            if (filtered_count < filtered_endpoints.len) {
+                                var pub_next = pub_addr;
+                                pub_next.setPort(pub_addr.getPort() + 1);
+                                filtered_endpoints[filtered_count] = pub_next;
+                                filtered_count += 1;
+                            }
                         }
                     } else {
                         log.info("检测到双方在不同网络，只尝试连接公网地址", .{});
                         if (remote_public_addr) |pub_addr| {
                             filtered_endpoints[filtered_count] = pub_addr;
                             filtered_count += 1;
+
+                            if (filtered_count < filtered_endpoints.len) {
+                                var pub_next = pub_addr;
+                                pub_next.setPort(pub_addr.getPort() + 1);
+                                filtered_endpoints[filtered_count] = pub_next;
+                                filtered_count += 1;
+                            }
                         } else {
                             log.warn("没有公网地址，退回到使用本地地址", .{});
                             filtered_endpoints[filtered_count] = remote_local_addr;
@@ -2759,16 +2787,48 @@ pub const PunchClient = struct {
                         std.Thread.sleep(50 * std.time.ns_per_ms);
 
                         // 发起方自己也要开始打洞！
-                        // 构造远程端点列表
-                        var remote_endpoints: [2]net.Address = undefined;
+                        // 构造远程端点列表（同公网 IP 才尝试内网地址，否则只用公网地址）
+                        var remote_endpoints: [4]net.Address = undefined;
                         var endpoint_count: usize = 0;
-                        if (remote_local) |addr| {
-                            remote_endpoints[endpoint_count] = addr;
-                            endpoint_count += 1;
-                        }
-                        if (remote_public) |addr| {
-                            remote_endpoints[endpoint_count] = addr;
-                            endpoint_count += 1;
+
+                        const same_lan = if (self.public_addr != null and remote_public != null) blk: {
+                            const my_ip = getIpBytes(self.public_addr.?);
+                            const remote_ip = getIpBytes(remote_public.?);
+                            break :blk std.mem.eql(u8, &my_ip, &remote_ip);
+                        } else false;
+
+                        if (same_lan) {
+                            if (remote_local) |addr| {
+                                remote_endpoints[endpoint_count] = addr;
+                                endpoint_count += 1;
+                            }
+                            if (remote_public) |addr| {
+                                remote_endpoints[endpoint_count] = addr;
+                                endpoint_count += 1;
+
+                                if (endpoint_count < remote_endpoints.len) {
+                                    var pub_next = addr;
+                                    pub_next.setPort(addr.getPort() + 1);
+                                    remote_endpoints[endpoint_count] = pub_next;
+                                    endpoint_count += 1;
+                                }
+                            }
+                        } else {
+                            if (remote_public) |addr| {
+                                remote_endpoints[endpoint_count] = addr;
+                                endpoint_count += 1;
+
+                                if (endpoint_count < remote_endpoints.len) {
+                                    var pub_next = addr;
+                                    pub_next.setPort(addr.getPort() + 1);
+                                    remote_endpoints[endpoint_count] = pub_next;
+                                    endpoint_count += 1;
+                                }
+                            } else if (remote_local) |addr| {
+                                // 理论上不会发生，没有公网地址时兜底
+                                remote_endpoints[endpoint_count] = addr;
+                                endpoint_count += 1;
+                            }
                         }
 
                         if (endpoint_count == 0) {
@@ -3037,39 +3097,61 @@ pub const PunchClient = struct {
             .nat_type = self.local_nat_type,
         };
 
-        // 解析对方地址 - 如果是同局域网，优先使用本地地址
-        var remote_endpoints: [2]net.Address = undefined;
+        // 解析对方地址 - 如果是同局域网，优先使用本地地址；始终加入公网端口+1 以匹配 C# 行为
+        var remote_endpoints: [4]net.Address = undefined;
         var remote_count: usize = 0;
 
-        if (begin.same_lan) {
-            // 同局域网：优先使用本地地址
-            if (begin.remote_local_endpoint.len > 0) {
-                if (parseEndpointString(begin.remote_local_endpoint)) |addr| {
-                    remote_endpoints[remote_count] = addr;
-                    remote_count += 1;
-                    log.debug("同局域网模式：使用本地地址 {s}", .{begin.remote_local_endpoint});
-                }
+        const remote_local_addr = if (begin.remote_local_endpoint.len > 0)
+            parseEndpointString(begin.remote_local_endpoint)
+        else
+            null;
+
+        const remote_public_addr = if (begin.remote_public_endpoint.len > 0)
+            parseEndpointString(begin.remote_public_endpoint)
+        else
+            null;
+
+        const same_lan = begin.same_lan or blk: {
+            if (self.public_addr != null and remote_public_addr != null) {
+                const my_ip = getIpBytes(self.public_addr.?);
+                const remote_ip = getIpBytes(remote_public_addr.?);
+                break :blk std.mem.eql(u8, &my_ip, &remote_ip);
             }
-            // 备选：公网地址
-            if (begin.remote_public_endpoint.len > 0) {
-                if (parseEndpointString(begin.remote_public_endpoint)) |addr| {
-                    remote_endpoints[remote_count] = addr;
+            break :blk false;
+        };
+
+        if (same_lan) {
+            if (remote_local_addr) |addr| {
+                remote_endpoints[remote_count] = addr;
+                remote_count += 1;
+                log.debug("同局域网模式：使用本地地址 {s}", .{begin.remote_local_endpoint});
+            }
+            if (remote_public_addr) |addr| {
+                remote_endpoints[remote_count] = addr;
+                remote_count += 1;
+
+                if (remote_count < remote_endpoints.len) {
+                    var pub_next = addr;
+                    pub_next.setPort(addr.getPort() + 1);
+                    remote_endpoints[remote_count] = pub_next;
                     remote_count += 1;
                 }
             }
         } else {
-            // 跨网络：优先使用公网地址
-            if (begin.remote_public_endpoint.len > 0) {
-                if (parseEndpointString(begin.remote_public_endpoint)) |addr| {
-                    remote_endpoints[remote_count] = addr;
+            if (remote_public_addr) |addr| {
+                remote_endpoints[remote_count] = addr;
+                remote_count += 1;
+
+                if (remote_count < remote_endpoints.len) {
+                    var pub_next = addr;
+                    pub_next.setPort(addr.getPort() + 1);
+                    remote_endpoints[remote_count] = pub_next;
                     remote_count += 1;
                 }
             }
-            if (begin.remote_local_endpoint.len > 0) {
-                if (parseEndpointString(begin.remote_local_endpoint)) |addr| {
-                    remote_endpoints[remote_count] = addr;
-                    remote_count += 1;
-                }
+            if (remote_local_addr) |addr| {
+                remote_endpoints[remote_count] = addr;
+                remote_count += 1;
             }
         }
 
