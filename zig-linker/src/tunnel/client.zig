@@ -2344,6 +2344,15 @@ pub const PunchClient = struct {
                         }
                     };
 
+                    // 调试: 检查 TCP 打洞 socket 状态
+                    if (begin.transport.protocolType() == .tcp) {
+                        if (self.tcp_punch_socket) |_| {
+                            log.info("TCP 探测 socket 状态: 已保持打开 ✓", .{});
+                        } else {
+                            log.warn("TCP 探测 socket 状态: 未打开 ✗ (NAT 映射可能已失效!)", .{});
+                        }
+                    }
+
                     // 构造传输信息
                     // direction 保持原样：forward 表示我是发起方，reverse 表示我是被动方
                     const transport_info = types.TunnelTransportInfo{
@@ -2658,6 +2667,15 @@ pub const PunchClient = struct {
                         if (endpoint_count == 0) {
                             log.err("没有可用的远程端点", .{});
                             continue;
+                        }
+
+                        // 调试: 检查 TCP 打洞 socket 状态（发起方）
+                        if (req.transport.protocolType() == .tcp) {
+                            if (self.tcp_punch_socket) |_| {
+                                log.info("发起方 TCP 探测 socket 状态: 已保持打开 ✓", .{});
+                            } else {
+                                log.warn("发起方 TCP 探测 socket 状态: 未打开 ✗ (NAT 映射可能已失效!)", .{});
+                            }
                         }
 
                         // 构造传输信息
